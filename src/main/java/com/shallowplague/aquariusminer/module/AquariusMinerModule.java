@@ -2,6 +2,7 @@ package com.shallowplague.aquariusminer.module;
 
 import com.github.rfresh2.EventConsumer;
 import com.zenith.Proxy;
+import com.zenith.cache.data.entity.Entity;
 import com.zenith.cache.data.entity.EntityPlayer;
 import com.zenith.cache.data.inventory.Container;
 import com.zenith.event.client.ClientBotTick;
@@ -19,6 +20,8 @@ import com.zenith.module.api.Module;
 import com.zenith.util.math.MathHelper;
 import com.zenith.util.timer.Timer;
 import com.zenith.util.timer.Timers;
+import org.geysermc.mcprotocollib.protocol.data.game.entity.metadata.MetadataTypes;
+import org.geysermc.mcprotocollib.protocol.data.game.entity.type.EntityType;
 import org.geysermc.mcprotocollib.protocol.data.game.inventory.DropItemAction;
 import org.geysermc.mcprotocollib.protocol.data.game.inventory.ShiftClickItemAction;
 import org.geysermc.mcprotocollib.protocol.data.game.item.ItemStack;
@@ -65,7 +68,8 @@ public class AquariusMinerModule extends Module {
     private boolean areaLimited = false;
     private int areaMinX, areaMaxX, areaMinZ, areaMaxZ;     // block coords inclusive (X/Z); Y = minY..maxY
     private int gridCxMin, gridCxMax, gridCzMin, gridCzMax; // chunk grid covering the box
-    private int areaChunksTotal, areaChunksDone;            // progress + completion detection
+    private int areaChunksTotal, areaChunksDone;            // progress (per horizontal layer) + completion detection
+    private int curLayerTopY = 0;                          // bounded area: top Y of the layer being swept (descends top-down)
     private boolean finishAfterStore = false;              // area cleared -> store remainder -> complete
 
     // cave-handling snapshot of CONFIG.client.extra.pathfinder.* (restored on disable)
@@ -85,6 +89,20 @@ public class AquariusMinerModule extends Module {
     private boolean paused = false;     // hard pause (inventory full + can't store) -> needs toggle
     private boolean hazardPaused = false; // soft pause (player nearby) -> auto-resumes when clear
     private boolean complete = false;   // the run finished (finite area fully cleared)
+
+    // vacuum pass: after a sub-box clears, walk over its dropped keep-items before moving on
+    private boolean collecting = false;
+    private int collectTargetId = -1;                 // entity id of the drop we're walking to (-1 = none)
+    private int collectTargetTicks = 0;               // ticks spent reaching the current drop (give-up watch)
+    private int collectTotalTicks = 0;                // ticks spent on this whole sub-box's vacuum (overall cap)
+    private final java.util.Set<Integer> collectSkip = new java.util.HashSet<>(); // drops we gave up reaching
+    private static final int COLLECT_ITEM_TICKS = 20 * 8; // 8s to reach one drop, else skip it
+
+    // restock: tool keyword latched at the start of a cycle (primary, or "shovel" when also-restock-shovel)
+    private String restockKeyword = "pickaxe";
+
+    // resource scan (pre-mine): the last scan's formatted lines, replayed by '/aquariusminer scan'
+    private java.util.List<String> scanLines = new java.util.ArrayList<>();
 
     // storage sub state machine
     private enum StorePhase { FIND_SPOT, PLACE, OPEN, DEPOSIT, CLOSE, BREAK, PICKUP, RESUME }
@@ -189,6 +207,7 @@ public class AquariusMinerModule extends Module {
         echestExhausted = false;
         restocking = false;
         depositing = false;
+        collecting = false;
         finishAfterDeposit = false;
         paused = false;
         hazardPaused = false;
@@ -243,6 +262,8 @@ public class AquariusMinerModule extends Module {
         storing = false; restocking = false; storePos = null; storeItem = null;
         echestCycle = false; echestExhausted = false; echPos = null; shulkPos = null;
         depositing = false; finishAfterDeposit = false; tripExtracted = false; tripRefilled = false; triedChests.clear();
+        collecting = false; collectTargetId = -1; collectSkip.clear();
+        restockKeyword = PLUGIN_CONFIG.miner.restockToolKeyword;
         paused = false; hazardPaused = false; complete = false; finishAfterStore = false;
         var cfg = PLUGIN_CONFIG.miner;
         if (areaLimited) {
@@ -252,6 +273,7 @@ public class AquariusMinerModule extends Module {
             info("Starting quarry at chunk [{}, {}] (unlimited), Y {}..{}",
                 startCX, startCZ, cfg.minY, cfg.maxY);
         }
+        runChunkScan();   // one-time pre-mine resource scan (logged + replayable via /aquariusminer scan)
     }
 
     /** Work out the chunk grid + spiral-centre chunk for this run from the configured area mode. */
@@ -293,16 +315,101 @@ public class AquariusMinerModule extends Module {
     }
 
     /** Reset the outward-square spiral stepper to the centre and recompute the area chunk count. */
-    private void seedSpiral() {
+    /** Reset just the spiral cursor (used at run start AND at the start of each new horizontal layer). */
+    private void resetSpiralStepper() {
         sx = 0; sz = 0; sdx = 1; sdz = 0;
         segLen = 1; segRemaining = 1; segsDone = 0;
         curCX = startCX; curCZ = startCZ;
         subBoxes.clear(); subBoxIdx = 0;
         areaChunksDone = 0;
+    }
+
+    private void seedSpiral() {
+        resetSpiralStepper();
+        curLayerTopY = PLUGIN_CONFIG.miner.maxY;   // bounded: sweep from the top layer downward
         areaChunksTotal = areaLimited
             ? (gridCxMax - gridCxMin + 1) * (gridCzMax - gridCzMin + 1)
             : 0;
     }
+
+    /** Vertical thickness of each top-down horizontal layer (bounded areas), clamped to >= 1. */
+    private int layerThickness() { return Math.max(1, PLUGIN_CONFIG.miner.layerHeight); }
+
+    /** Y floor of the layer currently being swept (bounded), clamped to the area floor (minY). */
+    private int curLayerBottomY() { return Math.max(PLUGIN_CONFIG.miner.minY, curLayerTopY - layerThickness() + 1); }
+
+    // ---------------------------------------------------------------- resource scan (pre-mine)
+
+    /**
+     * Scan the mining area ONCE before mining and log the most-abundant blocks/ores. Headless, so there's
+     * no HUD — the result is logged and shown via in-game alert, and replayable with {@code /aquariusminer
+     * scan}. Footprint is EXACTLY the area to be mined: the bounded box, else the start chunk for the
+     * infinite spiral. Y span is the mining band (never above maxY). Only loaded chunks are read; a block
+     * budget caps the one-time work.
+     */
+    private void runChunkScan() {
+        var cfg = PLUGIN_CONFIG.miner;
+        int topY = cfg.maxY, botY = cfg.minY;
+        int x1, z1, x2, z2;
+        if (areaLimited) { x1 = areaMinX; z1 = areaMinZ; x2 = areaMaxX; z2 = areaMaxZ; }
+        else { int bx = startCX << 4, bz = startCZ << 4; x1 = bx; z1 = bz; x2 = bx + 15; z2 = bz + 15; }
+
+        java.util.HashMap<String, Integer> counts = new java.util.HashMap<>();
+        int chunks = 0;
+        long budget = 0;
+        final long BUDGET_MAX = 16_000_000L;
+        for (int cx = (x1 >> 4); cx <= (x2 >> 4); cx++) {
+            for (int cz = (z1 >> 4); cz <= (z2 >> 4); cz++) {
+                if (!World.isChunkLoadedChunkPos(cx, cz)) continue; // can't read ungenerated chunks
+                chunks++;
+                int bxMin = Math.max(x1, cx << 4), bxMax = Math.min(x2, (cx << 4) + 15);
+                int bzMin = Math.max(z1, cz << 4), bzMax = Math.min(z2, (cz << 4) + 15);
+                for (int bx = bxMin; bx <= bxMax; bx++)
+                    for (int bz = bzMin; bz <= bzMax; bz++)
+                        for (int by = botY; by <= topY; by++) {
+                            if (++budget > BUDGET_MAX) { buildScanLines(counts, chunks, botY, topY); return; }
+                            var block = World.getBlock(bx, by, bz);
+                            if (block.isAir()) continue;            // ignore air (dominates a quarry)
+                            counts.merge(block.name(), 1, Integer::sum); // water/lava count like any block
+                        }
+            }
+        }
+        buildScanLines(counts, chunks, botY, topY);
+    }
+
+    /** Rank the tally into the top 3 blocks + top 5 ores, store the lines, and print them. */
+    private void buildScanLines(java.util.Map<String, Integer> counts, int chunks, int botY, int topY) {
+        java.util.List<java.util.Map.Entry<String, Integer>> blocks = new java.util.ArrayList<>();
+        java.util.List<java.util.Map.Entry<String, Integer>> ores = new java.util.ArrayList<>();
+        for (var e : counts.entrySet()) (isOreName(e.getKey()) ? ores : blocks).add(e);
+        java.util.Comparator<java.util.Map.Entry<String, Integer>> byDesc = (a, b) -> Integer.compare(b.getValue(), a.getValue());
+        blocks.sort(byDesc);
+        ores.sort(byDesc);
+
+        scanLines = new java.util.ArrayList<>();
+        scanLines.add(String.format("Resource scan: %d chunk%s, y%d..%d", chunks, chunks == 1 ? "" : "s", botY, topY));
+        scanLines.add("Top blocks:");
+        if (blocks.isEmpty()) scanLines.add("  (none)");
+        else for (int i = 0; i < Math.min(3, blocks.size()); i++)
+            scanLines.add("  " + blocks.get(i).getKey() + "  " + fmtCount(blocks.get(i).getValue()));
+        scanLines.add("Top ores:");
+        if (ores.isEmpty()) scanLines.add("  (none)");
+        else for (int i = 0; i < Math.min(5, ores.size()); i++)
+            scanLines.add("  " + ores.get(i).getKey() + "  " + fmtCount(ores.get(i).getValue()));
+        printScan();
+    }
+
+    /** Log the last scan and flash it as an in-game alert. Called after a scan and by the 'scan' command. */
+    public void printScan() {
+        if (scanLines.isEmpty()) { info("No scan yet - enable the miner to scan the area."); return; }
+        for (String l : scanLines) info(l);
+        inGameAlertActivePlayer("<aqua>" + String.join("  |  ", scanLines));
+    }
+
+    private boolean isOreName(String n) { return n.contains("_ore") || n.equals("ancient_debris"); }
+
+    /** Counts run into the 100k+ for deepslate; cap the displayed number to 6 digits. */
+    private String fmtCount(int n) { return n > 999999 ? "999999+" : Integer.toString(n); }
 
     /** Sign (+1/-1) of the bot's horizontal facing per axis {x, z} (yaw only). East=+X, South=+Z. */
     private int[] facingExtend() {
@@ -336,6 +443,10 @@ public class AquariusMinerModule extends Module {
         }
         if (depositing) {
             depositTripTick();
+            return;
+        }
+        if (collecting) {
+            collectTick();
             return;
         }
 
@@ -401,8 +512,8 @@ public class AquariusMinerModule extends Module {
                 }
                 return;
             }
-            // this sub-box completed naturally (box is clear) -> next sub-box, or finish the chunk
-            afterSubBox();
+            // this sub-box completed naturally (box is clear) -> vacuum its drops, then advance
+            beginCollect();
             return;
         }
 
@@ -423,15 +534,93 @@ public class AquariusMinerModule extends Module {
         }
     }
 
+    // ----- COLLECT: vacuum the just-cleared sub-box's drops before moving on -----
+
+    /** Sub-box cleared: if there's a kept drop on the floor (and room to hold it), vacuum it; else advance. */
+    private void beginCollect() {
+        var cfg = PLUGIN_CONFIG.miner;
+        if (!cfg.collectDrops || !canHoldMoreKeep() || nearestDrop() == null) { afterSubBox(); return; }
+        collecting = true;
+        collectTargetId = -1;
+        collectTargetTicks = 0;
+        collectTotalTicks = 0;
+        collectSkip.clear();
+        areaActive = false; sawActive = false;   // the builder is done with this box
+        info("Vacuuming drops in sub-box {}/{}.", subBoxIdx + 1, subBoxes.size());
+    }
+
+    private void collectTick() {
+        var cfg = PLUGIN_CONFIG.miner;
+        if (!canHoldMoreKeep()) { finishCollect(); return; }                    // no room -> storage fires next
+        if (++collectTotalTicks > cfg.collectMaxSeconds * 20) { finishCollect(); return; } // overall cap
+
+        if (collectTargetId != -1) {
+            Entity e = CACHE.getEntityCache().getEntities().get(collectTargetId);
+            if (e != null && !e.isRemoved() && e.getEntityType() == EntityType.ITEM) {
+                if (++collectTargetTicks > COLLECT_ITEM_TICKS) { collectSkip.add(collectTargetId); collectTargetId = -1; }
+                else return;                                                    // keep heading to it (goal set)
+            } else collectTargetId = -1;                                        // picked up / gone
+        }
+
+        Entity next = nearestDrop();
+        if (next == null) { finishCollect(); return; }                          // all drops grabbed
+        collectTargetId = next.getEntityId();
+        collectTargetTicks = 0;
+        BlockPos p = next.blockPos();
+        BARITONE.pathTo(new GoalNear(p.x(), p.y(), p.z(), 2));                  // within ~1.4 blocks -> vanilla pickup
+    }
+
+    /** Nearest kept-item drop still on the floor in (or just around) the sub-box we're vacuuming. */
+    private @Nullable Entity nearestDrop() {
+        if (subBoxes.isEmpty()) return null;
+        int[] sb = subBoxes.get(subBoxIdx);
+        int x1 = sb[0] - 2, x2 = sb[2] + 2, z1 = sb[1] - 2, z2 = sb[3] + 2;
+        int yLo = (areaLimited ? curLayerBottomY() : PLUGIN_CONFIG.miner.minY) - 2;
+        int yHi = (areaLimited ? curLayerTopY : PLUGIN_CONFIG.miner.maxY) + 2;
+        Entity best = null;
+        double bestD = Double.MAX_VALUE;
+        for (Entity e : CACHE.getEntityCache().getEntities().values()) {
+            if (e.isRemoved() || e.getEntityType() != EntityType.ITEM) continue;
+            if (collectSkip.contains(e.getEntityId())) continue;
+            BlockPos p = e.blockPos();
+            if (p.x() < x1 || p.x() > x2 || p.z() < z1 || p.z() > z2 || p.y() < yLo || p.y() > yHi) continue;
+            if (!isKeepDrop(e)) continue;
+            double d = CACHE.getPlayerCache().distanceSqToSelf(e);
+            if (d < bestD) { bestD = d; best = e; }
+        }
+        return best;
+    }
+
+    /** True if the dropped item entity holds one of our keep-items. */
+    private boolean isKeepDrop(Entity e) {
+        ItemStack stack = e.getMetadataValue(8, MetadataTypes.ITEM, ItemStack.class);
+        return stack != null && isKeep(stack);
+    }
+
+    /** Done vacuuming this sub-box: stop walking and advance the quarry. */
+    private void finishCollect() {
+        if (BARITONE.isActive()) BARITONE.stop();
+        collecting = false;
+        collectTargetId = -1;
+        afterSubBox();
+    }
+
     private void finishChunkAndAdvance() {
         areaActive = false;
         sawActive = false;
         clearTicks = 0;
         info("Chunk [{}, {}] cleared.", curCX, curCZ);
-        // bounded area: count this chunk; finish the run once every in-box chunk is cleared
+        // bounded area: count this chunk toward the CURRENT LAYER. Once every chunk in the layer is done,
+        // drop one layer and re-sweep the whole area; finish the run when the layer reaches the floor.
         if (areaLimited && ++areaChunksDone >= areaChunksTotal) {
-            onAreaComplete();
-            return;
+            if (curLayerBottomY() <= PLUGIN_CONFIG.miner.minY) {
+                onAreaComplete();
+                return;
+            }
+            curLayerTopY -= layerThickness();
+            resetSpiralStepper();              // re-sweep every chunk at the new, lower layer
+            info("Layer cleared - dropping to y[{}..{}] and sweeping the area.", curLayerBottomY(), curLayerTopY);
+            return;                            // next tick starts the new layer's first sub-box (paced)
         }
         advanceSpiral();
     }
@@ -507,16 +696,22 @@ public class AquariusMinerModule extends Module {
         if (subBoxes.isEmpty()) subBoxes.add(new int[]{ x1, z1, x2, z2 }); // safety (degenerate bounds)
     }
 
-    /** Issue clearArea for the current sub-box over the configured Y band. */
+    /**
+     * Issue clearArea for the current sub-box. A bounded area mines ONE horizontal layer at a time (the
+     * [curLayerBottomY..curLayerTopY] slice) so the whole area's top is swept before descending; the
+     * unbounded spiral clears the full Y band per chunk.
+     */
     private void issueSubBox() {
         var cfg = PLUGIN_CONFIG.miner;
         int[] sb = subBoxes.get(subBoxIdx);
-        BlockPos a = new BlockPos(sb[0], cfg.minY, sb[1]);
-        BlockPos b = new BlockPos(sb[2], cfg.maxY, sb[3]);
+        int y1 = areaLimited ? curLayerBottomY() : cfg.minY;
+        int y2 = areaLimited ? curLayerTopY      : cfg.maxY;
+        BlockPos a = new BlockPos(sb[0], y1, sb[1]);
+        BlockPos b = new BlockPos(sb[2], y2, sb[3]);
         areaActive = true;
         sawActive = false;
         clearTicks = 0;
-        info("Clearing chunk [{}, {}] sub-box {}/{} {} -> {}", curCX, curCZ, subBoxIdx + 1, subBoxes.size(), a, b);
+        info("Clearing chunk [{}, {}] sub-box {}/{} y[{}..{}] {} -> {}", curCX, curCZ, subBoxIdx + 1, subBoxes.size(), y1, y2, a, b);
         BARITONE.clearArea(a, b);
     }
 
@@ -1321,6 +1516,7 @@ public class AquariusMinerModule extends Module {
     private void beginRestock() {
         if (BARITONE.isActive()) BARITONE.stop();
         areaActive = false; sawActive = false;
+        restockKeyword = currentToolKeyword();   // latch which tool this cycle restocks (primary or shovel)
         restockShulkerPos = null; restockShulkerItem = null;
         int echestSlot = InventoryUtil.searchPlayerInventory(s -> matchesName(s, PLUGIN_CONFIG.miner.restockSourceItem));
         restockEchestItem = echestSlot == -1 ? null
@@ -1484,20 +1680,50 @@ public class AquariusMinerModule extends Module {
         return c == null ? List.of() : c;
     }
 
-    /** True if the bot has no usable tool left (no matching tool above the durability threshold). */
+    /**
+     * True if a tool we keep stocked is spent: no fresh PRIMARY tool, OR (also-restock-shovel on) no fresh
+     * shovel AND a fresh shovel actually exists in the tool-shulker to pull (best-effort — a missing shovel
+     * never triggers/pauses the run, unlike the primary tool).
+     */
     private boolean toolNeedsRestock() {
-        List<ItemStack> inv = CACHE.getPlayerCache().getPlayerInventory();
-        for (int i = 9; i <= 44; i++) {
-            if (isFreshTool(inv.get(i))) return false;
-        }
-        return true;
+        var cfg = PLUGIN_CONFIG.miner;
+        if (!hasFreshToolKw(cfg.restockToolKeyword)) return true;
+        if (cfg.alsoRestockShovel && !cfg.restockToolKeyword.equals("shovel")
+            && !hasFreshToolKw("shovel") && hasFreshToolInShulker("shovel")) return true;
+        return false;
     }
 
-    /** A tool whose name ends with the restock keyword and still has at least the threshold durability. */
-    private boolean isFreshTool(@Nullable ItemStack s) {
+    /** Which tool the CURRENT restock cycle pulls: the primary if it's missing, else the shovel. */
+    private String currentToolKeyword() {
+        var cfg = PLUGIN_CONFIG.miner;
+        return hasFreshToolKw(cfg.restockToolKeyword) ? "shovel" : cfg.restockToolKeyword;
+    }
+
+    /** A fresh tool (the one the FSM is pulling this cycle) — keyed to the latched restock keyword. */
+    private boolean isFreshTool(@Nullable ItemStack s) { return isFreshToolKw(s, restockKeyword); }
+
+    /** A tool whose name ends with {@code kw} and still has at least the threshold durability. */
+    private boolean isFreshToolKw(@Nullable ItemStack s, String kw) {
         String name = itemName(s);
-        if (name == null || !name.endsWith(PLUGIN_CONFIG.miner.restockToolKeyword)) return false;
+        if (name == null || !name.endsWith(kw)) return false;
         return remainingDurability(s) >= PLUGIN_CONFIG.miner.restockBelowDurability;
+    }
+
+    /** True if the inventory already holds a fresh tool ending with {@code kw}. */
+    private boolean hasFreshToolKw(String kw) {
+        List<ItemStack> inv = CACHE.getPlayerCache().getPlayerInventory();
+        for (int i = 9; i <= 44; i++) if (isFreshToolKw(inv.get(i), kw)) return true;
+        return false;
+    }
+
+    /** True if a carried tool-shulker holds a fresh tool ending with {@code kw} (so we could restock it). */
+    private boolean hasFreshToolInShulker(String kw) {
+        return InventoryUtil.searchPlayerInventory(s -> {
+            String n = itemName(s);
+            if (n == null || !n.endsWith("shulker_box")) return false;
+            for (ItemStack inner : containerContents(s)) if (isFreshToolKw(inner, kw)) return true;
+            return false;
+        }) != -1;
     }
 
     /** Remaining durability of a stack (MAX_DAMAGE - DAMAGE). Non-damageable items count as unlimited. */

@@ -41,7 +41,11 @@ public class AquariusMinerCommand extends Command {
                 "autodc on/off",
                 "pauseplayer on/off",
                 "restock on/off",
+                "shovel on/off",
                 "clearbox <size>",
+                "layer <blocks>",
+                "collect on/off | collect seconds <n>",
+                "scan",
                 "deposit on/off",
                 "deposit chest add <x> <y> <z> | clear",
                 "deposit supply add <x> <y> <z> | clear",
@@ -156,6 +160,28 @@ public class AquariusMinerCommand extends Command {
                 c.getSource().getEmbed().title("Clear-box size: " + getInteger(c, "size")
                     + " (smaller = better drop collection)");
             })))
+            .then(literal("layer").then(argument("blocks", integer(1)).executes(c -> {
+                PLUGIN_CONFIG.miner.layerHeight = getInteger(c, "blocks");
+                c.getSource().getEmbed().title("Layer height: " + getInteger(c, "blocks")
+                    + " (top-down; 1 = peel one level across the whole area before descending)");
+            })))
+            .then(literal("collect")
+                .then(argument("toggle", toggle()).executes(c -> {
+                    PLUGIN_CONFIG.miner.collectDrops = getToggle(c, "toggle");
+                    c.getSource().getEmbed().title("Collect drops " + toggleStrCaps(PLUGIN_CONFIG.miner.collectDrops));
+                }))
+                .then(literal("seconds").then(argument("n", integer(1)).executes(c -> {
+                    PLUGIN_CONFIG.miner.collectMaxSeconds = getInteger(c, "n");
+                    c.getSource().getEmbed().title("Collect cap: " + getInteger(c, "n") + "s per sub-box");
+                }))))
+            .then(literal("shovel").then(argument("toggle", toggle()).executes(c -> {
+                PLUGIN_CONFIG.miner.alsoRestockShovel = getToggle(c, "toggle");
+                c.getSource().getEmbed().title("Also restock shovel " + toggleStrCaps(PLUGIN_CONFIG.miner.alsoRestockShovel));
+            })))
+            .then(literal("scan").executes(c -> {
+                MODULE.get(AquariusMinerModule.class).printScan();
+                c.getSource().getEmbed().title("Resource scan printed to console + in-game alert");
+            }))
             .then(literal("deposit")
                 .then(argument("toggle", toggle()).executes(c -> {
                     PLUGIN_CONFIG.miner.depositToChests = getToggle(c, "toggle");
@@ -222,8 +248,11 @@ public class AquariusMinerCommand extends Command {
                 + (PLUGIN_CONFIG.miner.breakAndCollect ? ", break & collect" : ", leave"))
             .addField("Restock", PLUGIN_CONFIG.miner.restockTools
                 ? "on (" + PLUGIN_CONFIG.miner.restockToolKeyword + " < " + PLUGIN_CONFIG.miner.restockBelowDurability + ")"
+                    + (PLUGIN_CONFIG.miner.alsoRestockShovel ? " +shovel" : "")
                 : "off")
-            .addField("Collection", "clear-box " + PLUGIN_CONFIG.miner.clearBoxSize)
+            .addField("Collection", "clear-box " + PLUGIN_CONFIG.miner.clearBoxSize
+                + ", layer " + PLUGIN_CONFIG.miner.layerHeight
+                + ", vacuum " + toggleStr(PLUGIN_CONFIG.miner.collectDrops))
             .addField("Deposit", PLUGIN_CONFIG.miner.depositToChests
                 ? "on (" + PLUGIN_CONFIG.miner.depositChests.size() + " deposit, "
                     + PLUGIN_CONFIG.miner.supplyChests.size() + " supply"

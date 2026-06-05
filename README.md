@@ -18,6 +18,17 @@ process, which is already a box-confined, bottom-up, nearest-first quarry.
 - Each chunk is cleared in `clearBoxSize` sub-boxes (default 8) rather than all at once, so the bot
   repositions between cells and walks back over the ground it just dug — picking up the drops instead
   of leaving them on the floor to despawn.
+- A bounded area is mined **top-down in whole-area layers**: each `clearArea` box is a thin Y-slice
+  (`layer-height`, default 1) and the bot sweeps that slice across the entire area before dropping to the
+  next — so it never tunnels one cell to `minY` while the rest stands untouched. (The infinite spiral
+  still clears full-height per chunk — there's no top of an infinite area to pre-sweep.)
+- After each sub-box clears, a **vacuum pass** (`collect-drops`, default on) walks the bot over every
+  dropped keep-item still on the floor in that box and picks it up before moving on. It only chases your
+  `keep-items` (not junk), skips anything unreachable, and is capped by `collect-max-seconds`, so it can't
+  hang.
+- On enable it runs a one-time **resource scan** of the area and logs the 3 most abundant blocks and 5
+  most abundant ores (with counts, 6-digit-capped) — headless, so there's no HUD; it's logged, flashed as
+  an in-game alert, and replayable with `/aquariusminer scan`.
 - Junk blocks (an explicit denylist — never tools/food/shulkers) are dropped periodically so the
   inventory fills slower.
 - When the main inventory is (nearly) full, a **storage cycle** runs. Without deposit chests it places a
@@ -58,6 +69,10 @@ restart the proxy. Plugins are only supported on the `java` release channel.
 | `aquariusminer area corners <x1> <z1> <x2> <z2>` | Finite box between two X/Z coords (Y = the band) |
 | `aquariusminer cave on` / `off` | Relax pathfinder fall/jump limits to mine through caves |
 | `aquariusminer clearbox <size>` | Drop-collection sub-box size (smaller = more thorough, slower) |
+| `aquariusminer layer <blocks>` | Top-down layer thickness for a bounded area (1 = peel one level across the whole area) |
+| `aquariusminer collect on/off` / `seconds <n>` | Vacuum dropped keep-items after each sub-box; per-box time cap |
+| `aquariusminer shovel on/off` | Also keep a fresh shovel stocked (alongside the main tool) for gravel/sand |
+| `aquariusminer scan` | Re-print the last pre-mine resource scan (top blocks + ores) |
 | `aquariusminer deposit on` / `off` | Haul filled shulkers to base chests instead of leaving them behind |
 | `aquariusminer deposit chest add <x> <y> <z>` / `clear` | DEPOSIT chest(s) — where FILLED shulkers go |
 | `aquariusminer deposit supply add <x> <y> <z>` / `clear` | SUPPLY chest(s) — where EMPTY shulkers come from |

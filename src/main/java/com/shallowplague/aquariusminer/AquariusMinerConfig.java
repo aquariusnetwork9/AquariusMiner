@@ -169,6 +169,26 @@ public class AquariusMinerConfig {
          */
         public int clearBoxSize = 8;
 
+        /**
+         * Mine a bounded area in horizontal LAYERS this many blocks tall, TOP-DOWN: the bot clears this
+         * slice across the whole area before dropping to the next, so it never tunnels one cell to minY
+         * while the rest stands untouched. 1 = peel one block-level at a time across the area (most even,
+         * most travel); larger = fewer full-area passes (faster) but it digs this many deep per spot first.
+         * Set it to your full Y band (maxY-minY+1) for the old per-cell full-height behaviour. The
+         * unbounded spiral always clears full-height per chunk (no infinite top to pre-sweep).
+         */
+        public int layerHeight = 1;
+
+        /**
+         * After each sub-box clears, do a VACUUM pass: walk over every kept item (in {@link #keepItems})
+         * still lying on the ground in that box and pick it up before moving on, so nothing despawns.
+         * Time-capped by {@link #collectMaxSeconds} and skips anything unreachable, so it can't hang.
+         */
+        public boolean collectDrops = true;
+
+        /** Cap (seconds) on the vacuum pass per sub-box; past it, the bot gives up the stragglers and moves on. */
+        public int collectMaxSeconds = 20;
+
         // --- deposit chests (haul filled shulkers to a base) ---
         // When on, the storage cycle collects each filled shulker (instead of leaving it behind) and the
         // bot carries them to fixed DEPOSIT chests at a base to drop them off, then visits a separate
@@ -263,5 +283,12 @@ public class AquariusMinerConfig {
 
         /** Item-name suffix identifying the tool to restock (e.g. "pickaxe", "shovel"). */
         public String restockToolKeyword = "pickaxe";
+
+        /**
+         * Also keep a fresh SHOVEL alongside the main restock tool, so gravel/sand mines fast instead of
+         * being slogged through with a pickaxe. The tool-shulker must also hold spare shovels. Off, or when
+         * {@link #restockToolKeyword} is already "shovel", this does nothing.
+         */
+        public boolean alsoRestockShovel = true;
     }
 }
