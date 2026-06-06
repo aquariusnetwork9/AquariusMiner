@@ -144,7 +144,8 @@ public class AquariusMinerModule extends Module {
     private @Nullable BlockPos shulkPos = null;     // shulker placed this cycle
     private @Nullable ItemData echItem = null;      // the ender chest item type
     private @Nullable ItemData shulkItem = null;    // the empty shulker item type pulled from the echest
-    private boolean echestExhausted = false;        // the echest has no empty shulkers left -> deposit trip
+    private boolean echestExhausted = false;        // the echest has no empty shulkers left -> trip / end run
+    private boolean finishAfterEchest = false;      // bounded-area final pack into the echest -> complete the run
     private int echFillStall = 0;                   // shulker-full / echest-full stall detector
     private int lastEchCount = -1;
 
@@ -209,6 +210,7 @@ public class AquariusMinerModule extends Module {
         depositing = false;
         collecting = false;
         finishAfterDeposit = false;
+        finishAfterEchest = false;
         paused = false;
         hazardPaused = false;
         complete = false;
@@ -260,7 +262,7 @@ public class AquariusMinerModule extends Module {
         seedSpiral();
         areaActive = false; sawActive = false; clearTicks = 0;
         storing = false; restocking = false; storePos = null; storeItem = null;
-        echestCycle = false; echestExhausted = false; echPos = null; shulkPos = null;
+        echestCycle = false; echestExhausted = false; finishAfterEchest = false; echPos = null; shulkPos = null;
         depositing = false; finishAfterDeposit = false; tripExtracted = false; tripRefilled = false; triedChests.clear();
         collecting = false; collectTargetId = -1; collectSkip.clear();
         restockKeyword = PLUGIN_CONFIG.miner.restockToolKeyword;
@@ -475,14 +477,18 @@ public class AquariusMinerModule extends Module {
             ? !canHoldMoreKeep()                                // every keep stack at max, no empty slot
             : emptyMainSlots() <= cfg.freeSlotsBeforeFull;      // looser empty-slot margin
         if (invFull && hasKeepItems()) {
-            if (cfg.depositToChests) {
-                // the ender chest is the field buffer: pull an empty shulker out, fill it, store it back
-                if (hasEnderChest()) beginEchestCycle();
-                else pauseInvFull("no ender chest");
+            // Mirror Foreman: the ENDER CHEST is the field buffer whenever the bot carries one - pull an
+            // empty shulker out, fill it, and store the FILLED shulker back IN. Filled shulkers are never
+            // left on the ground or carried in the mining inventory. Deposit chests just add base trips on
+            // top. Only with no ender chest do we fall back to placing a shulker beside the bot.
+            if (hasEnderChest()) {
+                beginEchestCycle();
+            } else if (cfg.depositToChests) {
+                pauseInvFull("no ender chest (the deposit buffer)");
             } else if (cfg.storageEnabled && hasStorageItem()) {
                 beginStore();
             } else {
-                pauseInvFull(!cfg.storageEnabled ? "storage disabled" : "no storage item");
+                pauseInvFull(!cfg.storageEnabled ? "storage disabled" : "no ender chest or storage item");
             }
             return;
         }
@@ -634,6 +640,13 @@ public class AquariusMinerModule extends Module {
             finishAfterDeposit = true;
             info("Area cleared - delivering the last of the haul from the ender chest.");
             beginDepositTrip();
+            return;
+        }
+        // ender-chest buffer: pack the last partial inventory into the echest before finishing
+        if (hasEnderChest() && hasKeepItems()) {
+            finishAfterEchest = true;      // resumeFromEchest() will route to completeRun()
+            info("Area cleared - packing the last of the haul into the ender chest.");
+            beginEchestCycle();
             return;
         }
         if (cfg.storageEnabled && hasStorageItem() && hasKeepItems()) {
@@ -1098,14 +1111,14 @@ public class AquariusMinerModule extends Module {
             // it's exhausted -> a deposit trip fires from this clean state (so the trip's extract has room).
             if (c != null && findContainerSlot(c, this::isEmptyShulker) == -1 && countInInv(this::isEmptyShulker) == 0) {
                 echestExhausted = true;
-                info("Used the last empty shulker - ender chest is full; making a deposit trip.");
+                info("Used the last empty shulker - ender chest is full of filled shulkers.");
             }
             setEchestPhase(EchestPhase.CLOSE_ECHEST2);
             return;
         }
-        if (c != null && !containerHasRoom(c)) {        // echest full of shulkers -> also a trip trigger
+        if (c != null && !containerHasRoom(c)) {        // echest full of shulkers -> exhausted
             echestExhausted = true;
-            info("Ender chest is full of filled shulkers - making a deposit trip.");
+            info("Ender chest is full of filled shulkers.");
             setEchestPhase(EchestPhase.CLOSE_ECHEST2);
             return;
         }
@@ -1115,9 +1128,24 @@ public class AquariusMinerModule extends Module {
 
     private void resumeFromEchest() {
         echestCycle = false;
+        if (finishAfterEchest) {         // bounded-area final pack just finished -> complete the run
+            finishAfterEchest = false;
+            completeRun();
+            return;
+        }
         if (echestExhausted) {
             echestExhausted = false;
-            beginDepositTrip();          // echest full of filled shulkers -> haul them out
+            // Echest is full of filled shulkers. With deposit chests set, haul them out to base for an
+            // unlimited run; otherwise (Foreman's EnderChest mode) the haul is safely packed in the global
+            // ender chest - end the run rather than leaving shulkers behind.
+            if (PLUGIN_CONFIG.miner.depositToChests && !depositChestList().isEmpty()) {
+                beginDepositTrip();
+            } else {
+                complete = true;
+                info("Ender chest is full of filled shulkers - run complete. (Set deposit chests for an unlimited run.)");
+                inGameAlertActivePlayer("<green>Aquarius Miner: ender chest packed full - done");
+                endRun("ender chest full");
+            }
             return;
         }
         areaActive = false; sawActive = false;

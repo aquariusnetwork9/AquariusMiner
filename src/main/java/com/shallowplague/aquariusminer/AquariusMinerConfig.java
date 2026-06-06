@@ -123,17 +123,22 @@ public class AquariusMinerConfig {
         public int freeSlotsBeforeFull = 1;
 
         // --- storage cycle ---
+        // PRIMARY model (mirrors the Foreman mod): whenever the bot carries an ENDER CHEST it is the field
+        // buffer - an empty shulker is pulled out of it, filled with the haul, and the FILLED shulker is
+        // stored back INTO the ender chest. Filled shulkers are never left on the ground or carried in the
+        // mining inventory. The settings below are only the FALLBACK for when no ender chest is carried.
 
         /**
-         * When the inventory fills, place a container beside the bot and deposit {@link #keepItems}
-         * into it. If false, mining simply pauses when full.
+         * FALLBACK (no ender chest): when the inventory fills, place a shulker beside the bot and deposit
+         * {@link #keepItems} into it. If false (and no ender chest), mining simply pauses when full. Ignored
+         * when an ender chest is carried (the ender-chest buffer is used instead).
          */
         public boolean storageEnabled = true;
 
         /**
-         * After depositing, break the placed container and pick it up again (carry it). Off by
-         * default: shulkers are left behind full (the simplest, most reliable behaviour). Turning
-         * this on is mainly useful with an ender chest, whose contents are global.
+         * FALLBACK only (no ender chest): after depositing into the placed shulker, break it and pick it up
+         * again (carry it) instead of leaving it behind full. Has no effect when an ender chest is carried -
+         * there, filled shulkers always go back into the chest.
          */
         public boolean breakAndCollect = false;
 
@@ -190,12 +195,13 @@ public class AquariusMinerConfig {
         public int collectMaxSeconds = 20;
 
         // --- deposit chests (haul filled shulkers to a base) ---
-        // When on, the storage cycle collects each filled shulker (instead of leaving it behind) and the
-        // bot carries them to fixed DEPOSIT chests at a base to drop them off, then visits a separate
-        // SUPPLY chest to restock empty shulkers, for a near-unlimited run. Chest locations are set by
-        // command (the proxy is headless, so there is no in-world crosshair to mark with).
+        // Adds base trips ON TOP of the ender-chest buffer for a near-unlimited run. The buffer always
+        // stores filled shulkers back into the ender chest; with this on, once the chest fills with filled
+        // shulkers the bot hauls them to fixed DEPOSIT chests at a base, then visits a separate SUPPLY chest
+        // to restock empty shulkers. With this OFF, the run simply ends once the ender chest is packed full.
+        // Chest locations are set by command (the proxy is headless, so there is no in-world crosshair).
 
-        /** Master toggle: collect filled shulkers and haul them to the {@link #depositChests}. */
+        /** Add base-chest hauling trips on top of the ender-chest buffer (off = end the run when the chest is full). */
         public boolean depositToChests = false;
 
         /** DEPOSIT chest locations ("x y z" each) where FILLED shulkers are dropped off. */

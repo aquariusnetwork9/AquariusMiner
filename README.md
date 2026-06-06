@@ -31,12 +31,13 @@ process, which is already a box-confined, bottom-up, nearest-first quarry.
   an in-game alert, and replayable with `/aquariusminer scan`.
 - Junk blocks (an explicit denylist — never tools/food/shulkers) are dropped periodically so the
   inventory fills slower.
-- When the main inventory is (nearly) full, a **storage cycle** runs. Without deposit chests it places a
-  shulker box beside the bot, deposits the kept items, and (with `breakAndCollect`) breaks and re-collects
-  it. With **deposit chests** on, the **ender chest is the field buffer**: the bot pulls an empty shulker
-  out of the echest, fills it, and stores the FILLED shulker back into the echest — so filled shulkers
-  never clog the mining inventory.
-- A **deposit trip** fires only once the echest runs out of empties (detected the moment the last empty is
+- When the main inventory is (nearly) full, a **storage cycle** runs. Whenever the bot carries an **ender
+  chest** it is the field buffer (mirroring the Foreman mod): the bot pulls an empty shulker out of the
+  echest, fills it, and stores the FILLED shulker back **into** the echest — so filled shulkers are never
+  left on the ground or left to clog the mining inventory. Without deposit chests the run simply ends once
+  the ender chest is packed full of filled shulkers. (No ender chest? It falls back to placing a shulker
+  beside the bot, optionally `breakAndCollect`.)
+- A **deposit trip** (only when **deposit chests** are set) fires once the echest runs out of empties (detected the moment the last empty is
   used, with a clean inventory). The bot walks to the nearest **deposit chest** first with an empty
   inventory — the filled shulkers stay in the global echest until it's there, so a death en route can't
   strand them — then at the chest it pulls them out and drops them in, visits a separate **supply chest**
