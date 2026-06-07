@@ -121,7 +121,10 @@ each packet as it arrives. (This is independent of ZenithProxy's own `/debug pac
 ### Scenario templates
 
 A template restricts capture to a group of related packets (matched as substrings of the packet class
-name). Combine a template with `filter` to narrow further (e.g. `template entities` + `filter add`).
+name). Names are forgiving — a singular or unique prefix works (`template block` → `blocks`,
+`template chunk` → `chunks`). Combine a template with `filter` to narrow further (e.g. `template entities`
++ `filter add`). **Tip:** to diagnose *server lag* (not a block-specific issue), capture **unfiltered** —
+a server freeze shows as *all* packet types going silent at once, which a `blocks`-only filter would hide.
 
 | Template | Captures (packet-name substrings) |
 | --- | --- |

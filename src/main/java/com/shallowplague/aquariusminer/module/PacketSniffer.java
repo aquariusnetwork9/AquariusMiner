@@ -52,6 +52,26 @@ public class PacketSniffer extends PacketHandlerCodec {
         return TEMPLATES.getOrDefault(name, List.of());
     }
 
+    /**
+     * Resolve a user-typed template name to a canonical one, forgivingly: exact match, else a unique
+     * singular/prefix match (so "block" -&gt; "blocks", "chunk" -&gt; "chunks", "entit" -&gt; "entities").
+     * Returns null if unknown or ambiguous (e.g. "c" matches chat/chunks/combat).
+     */
+    public static String resolveTemplate(String input) {
+        if (input == null) return null;
+        String n = input.trim().toLowerCase();
+        if (n.isEmpty()) return null;
+        if (TEMPLATES.containsKey(n)) return n;
+        String match = null;
+        for (String key : TEMPLATES.keySet()) {
+            if (key.startsWith(n) || n.startsWith(key)) {   // "block" -> "blocks", "blocksX" -> "blocks"
+                if (match != null && !match.equals(key)) return null;   // ambiguous
+                match = key;
+            }
+        }
+        return match;
+    }
+
     /** Thread-safe rolling buffer: keeps only the most recent {@code cap} lines (oldest evicted). */
     public static final class Buffer {
         private final ArrayDeque<String> lines = new ArrayDeque<>();

@@ -363,15 +363,15 @@ public class AquariusMinerCommand extends Command {
                     .then(literal("off").executes(c -> { PLUGIN_CONFIG.miner.sniffTemplate = "";
                         c.getSource().getEmbed().title("Sniffer template cleared"); }))
                     .then(argument("name", word()).executes(c -> {
-                        String n = getString(c, "name").toLowerCase();
-                        if (!PacketSniffer.templateNames().contains(n)) {
-                            c.getSource().getEmbed().title("Unknown template: " + n)
+                        String resolved = PacketSniffer.resolveTemplate(getString(c, "name"));
+                        if (resolved == null) {
+                            c.getSource().getEmbed().title("Unknown template: " + getString(c, "name"))
                                 .description("Options: " + String.join(", ", PacketSniffer.templateNames()));
                             return ERROR;
                         }
-                        PLUGIN_CONFIG.miner.sniffTemplate = n;
-                        c.getSource().getEmbed().title("Sniffer template: " + n)
-                            .description("Matches names containing: " + String.join(", ", PacketSniffer.templateSubs(n)));
+                        PLUGIN_CONFIG.miner.sniffTemplate = resolved;
+                        c.getSource().getEmbed().title("Sniffer template: " + resolved)
+                            .description("Matches names containing: " + String.join(", ", PacketSniffer.templateSubs(resolved)));
                         return OK;
                     }))))
             .then(literal("deposit")
