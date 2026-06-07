@@ -102,6 +102,7 @@ public class AquariusMinerModule extends Module {
     private @Nullable BlockPos legitBreakPos = null; // the block currently being broken
     private int legitBreakTicks = 0;                 // ghost-block / stuck cap on the current block
     private int legitRepathTicks = 0;                // ticks spent repositioning to get a sightline
+    private long legitRepathTarget = Long.MIN_VALUE; // packed pos currently being repositioned toward (none = MIN)
     private final java.util.Set<Long> legitSkip = new java.util.HashSet<>(); // blocks given up on (verify re-runs the box)
     private static final int LEGIT_BREAK_TICKS = 20 * 12;  // 12s stuck on one block (deepslate is slow) -> skip as ghost
     private static final int LEGIT_REPATH_TICKS = 20 * 8;  // 8s trying to get a sightline on a block -> skip it
@@ -305,7 +306,7 @@ public class AquariusMinerModule extends Module {
         resolveArea(px >> 4, pz >> 4);
         seedSpiral();
         areaActive = false; sawActive = false; clearTicks = 0; subBoxRetries = 0;
-        legitActive = false; legitBreakPos = null; legitBreakTicks = 0; legitRepathTicks = 0; legitSkip.clear();
+        legitActive = false; legitBreakPos = null; legitBreakTicks = 0; legitRepathTicks = 0; legitRepathTarget = Long.MIN_VALUE; legitSkip.clear();
         storing = false; restocking = false; storePos = null; storeItem = null;
         foodRestocking = false; foodRestockExhausted = false; foodEchestPos = null; foodShulkerPos = null;
         echestCycle = false; echestExhausted = false; finishAfterEchest = false; echPos = null; shulkPos = null;
@@ -799,7 +800,7 @@ public class AquariusMinerModule extends Module {
         int y2 = areaLimited ? curLayerTopY      : cfg.maxY;
         if (cfg.legitMine) {
             legitActive = true;
-            legitBreakPos = null; legitBreakTicks = 0; legitRepathTicks = 0;
+            legitBreakPos = null; legitBreakTicks = 0; legitRepathTicks = 0; legitRepathTarget = Long.MIN_VALUE;
             legitSkip.clear();
             clearTicks = 0;
             info("Clearing (legit) chunk [{}, {}] sub-box {}/{} y[{}..{}]", curCX, curCZ, subBoxIdx + 1, subBoxes.size(), y1, y2);
@@ -852,11 +853,15 @@ public class AquariusMinerModule extends Module {
             legitBreakPos = los;
             legitBreakTicks = 0;
             legitRepathTicks = 0;
+            legitRepathTarget = Long.MIN_VALUE;
             BARITONE.breakBlock(los.x(), los.y(), los.z(), true);
             return;
         }
 
-        // 3) nothing visible: if blocks remain, walk to get a sightline; else the box is clear
+        // 3) nothing visible: reposition ONCE toward the nearest remaining block to try for a sightline. If the
+        //    bot arrives (path finished) and STILL can't see it, walking can't help - it's occluded, so skip it
+        //    immediately instead of idling the full repath timeout. (A pocket of occluded blocks used to cost
+        //    ~8s EACH here, stacking into multi-minute "stalls".) Skipped blocks feed verify-retry.
         BlockPos remaining = nearestSolidBlock();
         if (remaining == null) {
             endLegitSubBox();
@@ -864,13 +869,23 @@ public class AquariusMinerModule extends Module {
             beginCollect();
             return;
         }
-        if (++legitRepathTicks > LEGIT_REPATH_TICKS) {
-            legitSkip.add(packPos(remaining));                       // can't get a sightline in time -> skip
+        long rkey = packPos(remaining);
+        if (rkey != legitRepathTarget) {                             // new target -> path toward a vantage, once
+            legitRepathTarget = rkey;
             legitRepathTicks = 0;
-            if (BARITONE.isActive()) BARITONE.stop();
+            BARITONE.pathTo(new GoalNear(remaining.x(), remaining.y(), remaining.z(), 9));
             return;
         }
-        if (!BARITONE.isActive()) BARITONE.pathTo(new GoalNear(remaining.x(), remaining.y(), remaining.z(), 9));
+        if (BARITONE.isActive()) {                                   // still walking to the vantage - bounded wait
+            if (++legitRepathTicks > LEGIT_REPATH_TICKS) {
+                legitSkip.add(rkey);
+                legitRepathTarget = Long.MIN_VALUE; legitRepathTicks = 0;
+                BARITONE.stop();
+            }
+            return;
+        }
+        legitSkip.add(rkey);                                         // arrived, still no sightline -> occluded, skip
+        legitRepathTarget = Long.MIN_VALUE; legitRepathTicks = 0;
     }
 
     private void endLegitSubBox() {
@@ -878,6 +893,7 @@ public class AquariusMinerModule extends Module {
         legitBreakPos = null;
         legitBreakTicks = 0;
         legitRepathTicks = 0;
+        legitRepathTarget = Long.MIN_VALUE;
         legitSkip.clear();
         if (BARITONE.isActive()) BARITONE.stop();
     }

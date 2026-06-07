@@ -319,32 +319,6 @@ public class AquariusMinerConfig {
          */
         public boolean alsoRestockShovel = true;
 
-        // --- packet sniffer (debug) ---
-        // A separate module that taps ZenithProxy's CLIENT_REGISTRY (bot <-> 2b2t): every packet to/from the
-        // server is captured into a rolling {@link #sniffBufferLines}-line buffer, dumpable on demand. Enabling
-        // it registers the codec; disabling unregisters it (zero overhead when off). See /aquariusminer sniff.
-
-        /** Master toggle for the packet sniffer. Enabling registers the client packet codec. */
-        public boolean sniffEnabled = false;
-
-        /** Also log every captured packet live as it arrives (vs. quietly filling the rolling buffer only). */
-        public boolean sniffLive = false;
-
-        /** Include the full packet contents (toString) instead of just the class name. */
-        public boolean sniffBody = false;
-
-        /** Which direction to capture: "in" (from server), "out" (to server), or "both". */
-        public String sniffDir = "both";
-
-        /** Only capture packets whose class name contains this (case-insensitive). Empty = no filter. */
-        public String sniffFilter = "";
-
-        /** Scenario template name limiting capture to a packet group (e.g. movement/combat/chunks). Empty = all. */
-        public String sniffTemplate = "";
-
-        /** The rolling buffer keeps only the most recent N captured lines (oldest evicted). */
-        public int sniffBufferLines = 250;
-
         // --- food restock ---
         // 2b bots keep food (golden carrots, enchanted/normal golden apples, cooked meat) in a FOOD-SHULKER
         // inside the ender chest. The built-in AutoEat module eats it; this tops it up. When the carried food
