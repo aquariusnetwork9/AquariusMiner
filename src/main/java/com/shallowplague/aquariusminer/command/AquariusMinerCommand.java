@@ -4,6 +4,7 @@ import com.shallowplague.aquariusminer.module.AquariusMinerModule;
 import com.shallowplague.aquariusminer.AquariusMinerConfig.AreaAnchor;
 import com.shallowplague.aquariusminer.AquariusMinerConfig.AreaMode;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
+import com.zenith.Proxy;
 import com.zenith.command.api.Command;
 import com.zenith.command.api.CommandCategory;
 import com.zenith.command.api.CommandContext;
@@ -12,6 +13,9 @@ import com.zenith.discord.Embed;
 
 import static com.mojang.brigadier.arguments.IntegerArgumentType.getInteger;
 import static com.mojang.brigadier.arguments.IntegerArgumentType.integer;
+import static com.mojang.brigadier.arguments.StringArgumentType.getString;
+import static com.mojang.brigadier.arguments.StringArgumentType.word;
+import static com.zenith.Globals.CACHE;
 import static com.zenith.Globals.MODULE;
 import static com.zenith.command.brigadier.ToggleArgumentType.getToggle;
 import static com.zenith.command.brigadier.ToggleArgumentType.toggle;
@@ -23,18 +27,21 @@ public class AquariusMinerCommand extends Command {
         return CommandUsage.builder()
             .name("aquariusminer")
             .category(CommandCategory.MODULE)
+            .aliases("aqm")
             .description("""
                 AFK quarry miner. Clears one chunk at a time within a Y band, spiralling
-                outward from where the bot is when enabled.
+                outward from where the bot is when enabled. Short alias: .aqm
                 """)
             .usageLines(
                 "on/off",
                 "minY <y>",
                 "maxY <y>",
+                "here <length> <width>  (length forward, width right, from bot pos+facing)",
                 "area unlimited",
                 "area chunks <width> <length>",
                 "area anchor <center/corner>",
                 "area corners <x1> <z1> <x2> <z2>",
+                "keep add <item> | remove <item> | list | clear | reset",
                 "cave on/off",
                 "fullstacks on/off",
                 "badfood on/off",
@@ -89,6 +96,83 @@ public class AquariusMinerCommand extends Command {
                 c.getSource().getEmbed().title("Max Y Set");
                 return OK;
             })))
+            // Set the mining box from the bot's CURRENT position + facing: <length> chunks forward (the way
+            // the bot looks, snapped to a cardinal) x <width> chunks to its right. Snapshots pos+yaw NOW into an
+            // absolute Corners box, so it stays put even if the bot turns/walks later. Re-anchors live if running.
+            .then(literal("here")
+                .then(argument("length", integer(1))
+                    .then(argument("width", integer(1)).executes(c -> {
+                        if (!Proxy.getInstance().isConnected()) {
+                            c.getSource().getEmbed().title("Error")
+                                .description("Bot isn't connected - can't read its position/facing.");
+                            return ERROR;
+                        }
+                        int len = getInteger(c, "length");
+                        int wid = getInteger(c, "width");
+                        var pc = CACHE.getPlayerCache();
+                        int px = (int) Math.floor(pc.getX());
+                        int pz = (int) Math.floor(pc.getZ());
+                        double yaw = Math.toRadians(pc.getYaw());
+                        double lx = -Math.sin(yaw), lz = Math.cos(yaw);
+                        int fdx, fdz;                                  // forward unit vector, snapped to a cardinal
+                        if (Math.abs(lx) >= Math.abs(lz)) { fdx = lx >= 0 ? 1 : -1; fdz = 0; }
+                        else { fdx = 0; fdz = lz >= 0 ? 1 : -1; }
+                        int rdx = -fdz, rdz = fdx;                     // right = forward rotated 90 deg clockwise
+                        int cx0 = px >> 4, cz0 = pz >> 4;              // bot's chunk = the near corner
+                        int cxB = cx0 + fdx * (len - 1) + rdx * (wid - 1);
+                        int czB = cz0 + fdz * (len - 1) + rdz * (wid - 1);
+                        int cxLo = Math.min(cx0, cxB), cxHi = Math.max(cx0, cxB);
+                        int czLo = Math.min(cz0, czB), czHi = Math.max(cz0, czB);
+                        var m = PLUGIN_CONFIG.miner;
+                        m.areaMode = AreaMode.Corners;
+                        m.corner1X = cxLo << 4;          m.corner1Z = czLo << 4;
+                        m.corner2X = (cxHi << 4) + 15;   m.corner2Z = (czHi << 4) + 15;
+                        boolean live = m.enabled;
+                        if (live) MODULE.get(AquariusMinerModule.class).requestReanchor();
+                        c.getSource().getEmbed()
+                            .title("Area: " + len + " x " + wid + " chunks from here (" + (len * wid) + " total)")
+                            .description(len + " forward (" + cardinal(fdx, fdz) + "), "
+                                + wid + " right (" + cardinal(rdx, rdz) + ")\n"
+                                + "X[" + (cxLo << 4) + ".." + ((cxHi << 4) + 15) + "] "
+                                + "Z[" + (czLo << 4) + ".." + ((czHi << 4) + 15) + "], Y "
+                                + m.minY + ".." + m.maxY + "\n"
+                                + (live ? "Re-anchored live - mining the new box now." : "Run `.aqm on` to start."));
+                        return OK;
+                    }))))
+            .then(literal("keep")
+                .then(literal("add").then(argument("item", word()).executes(c -> {
+                    String item = getString(c, "item").toLowerCase();
+                    if (PLUGIN_CONFIG.miner.keepItems.contains(item)) {
+                        c.getSource().getEmbed().title("Already kept: " + item);
+                    } else {
+                        PLUGIN_CONFIG.miner.keepItems.add(item);
+                        c.getSource().getEmbed().title("Keeping " + item)
+                            .description("Now keeping: " + String.join(", ", PLUGIN_CONFIG.miner.keepItems));
+                    }
+                })))
+                .then(literal("remove").then(argument("item", word()).executes(c -> {
+                    String item = getString(c, "item").toLowerCase();
+                    boolean removed = PLUGIN_CONFIG.miner.keepItems.remove(item);
+                    c.getSource().getEmbed().title(removed ? "Stopped keeping " + item : "Not in keep list: " + item)
+                        .description("Now keeping: " + String.join(", ", PLUGIN_CONFIG.miner.keepItems));
+                })))
+                .then(literal("list").executes(c -> {
+                    var keep = PLUGIN_CONFIG.miner.keepItems;
+                    c.getSource().getEmbed().title("Keep items (" + keep.size() + ")")
+                        .description(keep.isEmpty() ? "(none)" : String.join(", ", keep));
+                }))
+                .then(literal("clear").executes(c -> {
+                    PLUGIN_CONFIG.miner.keepItems.clear();
+                    c.getSource().getEmbed().title("Keep list cleared")
+                        .description("Nothing will be deposited - add ores/blocks with `.aqm keep add <item>`.");
+                }))
+                .then(literal("reset").executes(c -> {
+                    PLUGIN_CONFIG.miner.keepItems.clear();
+                    PLUGIN_CONFIG.miner.keepItems.add("deepslate");
+                    PLUGIN_CONFIG.miner.keepItems.add("cobbled_deepslate");
+                    c.getSource().getEmbed().title("Keep list reset")
+                        .description("Now keeping: " + String.join(", ", PLUGIN_CONFIG.miner.keepItems));
+                })))
             .then(literal("area")
                 .then(literal("unlimited").executes(c -> {
                     PLUGIN_CONFIG.miner.areaMode = AreaMode.Unlimited;
@@ -242,6 +326,15 @@ public class AquariusMinerCommand extends Command {
                     PLUGIN_CONFIG.miner.maxDepositDistance = getInteger(c, "blocks");
                     c.getSource().getEmbed().title("Max deposit distance: " + getInteger(c, "blocks") + " blocks");
                 }))));
+    }
+
+    /** Cardinal name for a unit chunk-direction (one axis zero): -Z north, +Z south, +X east, -X west. */
+    private static String cardinal(int dx, int dz) {
+        if (dz < 0) return "north";
+        if (dz > 0) return "south";
+        if (dx > 0) return "east";
+        if (dx < 0) return "west";
+        return "?";
     }
 
     private static String areaDescription() {
