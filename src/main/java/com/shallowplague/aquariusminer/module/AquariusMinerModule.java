@@ -14,6 +14,8 @@ import com.zenith.feature.inventory.util.InventoryUtil;
 import com.zenith.feature.pathfinder.goals.GoalNear;
 import com.zenith.feature.player.World;
 import com.zenith.mc.block.BlockPos;
+import com.zenith.mc.food.FoodData;
+import com.zenith.mc.food.FoodRegistry;
 import com.zenith.mc.item.ItemData;
 import com.zenith.mc.item.ItemRegistry;
 import com.zenith.module.api.Module;
@@ -86,6 +88,7 @@ public class AquariusMinerModule extends Module {
     // over (and collects) its drops. subBoxes holds the {x1,z1,x2,z2} cells of the current chunk.
     private final java.util.List<int[]> subBoxes = new java.util.ArrayList<>();
     private int subBoxIdx = 0;
+    private int subBoxRetries = 0;      // re-runs of the current sub-box after a verify found leftovers (1.3.2 port)
     private boolean paused = false;     // hard pause (inventory full + can't store) -> needs toggle
     private boolean hazardPaused = false; // soft pause (player nearby) -> auto-resumes when clear
     private boolean complete = false;   // the run finished (finite area fully cleared)
@@ -128,6 +131,25 @@ public class AquariusMinerModule extends Module {
     private @Nullable BlockPos restockShulkerPos = null;
     private @Nullable ItemData restockEchestItem = null;
     private @Nullable ItemData restockShulkerItem = null;
+
+    // food restock sub state machine (crack a FOOD-shulker from the ender chest and top up carried food).
+    // Mirrors the tool restock cycle but pulls food by preference; BEST-EFFORT (a missing food-shulker never
+    // pauses the run - it latches foodRestockExhausted and keeps mining).
+    private enum FoodPhase {
+        PLACE_ECHEST, OPEN_ECHEST, TAKE_SHULKER, CLOSE_ECHEST,
+        PLACE_SHULKER, OPEN_SHULKER, TAKE_FOOD, CLOSE_SHULKER, BREAK_SHULKER, PICKUP_SHULKER,
+        REOPEN_ECHEST, RETURN_SHULKER, CLOSE_ECHEST2, BREAK_ECHEST, PICKUP_ECHEST, DONE
+    }
+    private boolean foodRestocking = false;
+    private FoodPhase foodPhase = FoodPhase.PLACE_ECHEST;
+    private int foodStepTicks = 0;
+    private boolean foodRestockExhausted = false;   // no food-shulker in the echest -> stop retrying this run
+    private int foodTakeStall = 0;                   // food-take stall detector (shulker empty / no room)
+    private int lastFoodCount = -1;
+    private @Nullable BlockPos foodEchestPos = null;
+    private @Nullable BlockPos foodShulkerPos = null;
+    private @Nullable ItemData foodEchestItem = null;
+    private @Nullable ItemData foodShulkerItem = null;
 
     // echest-buffer storage cycle (deposit mode): the ender chest is the FIELD buffer. Pull an empty
     // shulker out of it, fill it with the haul, store the FILLED shulker back in - so filled shulkers
@@ -207,6 +229,8 @@ public class AquariusMinerModule extends Module {
         echestCycle = false;
         echestExhausted = false;
         restocking = false;
+        foodRestocking = false;
+        foodRestockExhausted = false;
         depositing = false;
         collecting = false;
         finishAfterDeposit = false;
@@ -260,8 +284,9 @@ public class AquariusMinerModule extends Module {
         int pz = MathHelper.floorI(CACHE.getPlayerCache().getZ());
         resolveArea(px >> 4, pz >> 4);
         seedSpiral();
-        areaActive = false; sawActive = false; clearTicks = 0;
+        areaActive = false; sawActive = false; clearTicks = 0; subBoxRetries = 0;
         storing = false; restocking = false; storePos = null; storeItem = null;
+        foodRestocking = false; foodRestockExhausted = false; foodEchestPos = null; foodShulkerPos = null;
         echestCycle = false; echestExhausted = false; finishAfterEchest = false; echPos = null; shulkPos = null;
         depositing = false; finishAfterDeposit = false; tripExtracted = false; tripRefilled = false; triedChests.clear();
         collecting = false; collectTargetId = -1; collectSkip.clear();
@@ -443,6 +468,10 @@ public class AquariusMinerModule extends Module {
             restockTick();
             return;
         }
+        if (foodRestocking) {
+            foodTick();
+            return;
+        }
         if (depositing) {
             depositTripTick();
             return;
@@ -499,6 +528,12 @@ public class AquariusMinerModule extends Module {
             return;
         }
 
+        // 2.6) carried food low -> top up from a FOOD-shulker in the ender chest (best-effort, never pauses)
+        if (cfg.restockFood && !foodRestockExhausted && countGoodFood() < cfg.minFoodOnHand && hasRestockSource()) {
+            beginFoodRestock();
+            return;
+        }
+
         // 3) mining drive
         if (areaActive) {
             if (!sawActive) {
@@ -511,14 +546,16 @@ public class AquariusMinerModule extends Module {
             }
             if (BARITONE.isActive()) {
                 if (++clearTicks > cfg.maxClearTicks) {
-                    warn("Chunk [{}, {}] sub-box {}/{} timed out after {} ticks; advancing.",
+                    warn("Chunk [{}, {}] sub-box {}/{} timed out after {} ticks.",
                         curCX, curCZ, subBoxIdx + 1, subBoxes.size(), clearTicks);
                     BARITONE.stop();
+                    if (retrySubBoxIfDirty(true)) return;   // lag left blocks -> re-run the box first
                     afterSubBox();
                 }
                 return;
             }
-            // this sub-box completed naturally (box is clear) -> vacuum its drops, then advance
+            // this sub-box completed naturally (box is clear) -> verify, then vacuum its drops, then advance
+            if (retrySubBoxIfDirty(false)) return;
             beginCollect();
             return;
         }
@@ -532,6 +569,7 @@ public class AquariusMinerModule extends Module {
 
     /** A sub-box finished (or timed out): start the next sub-box, or finish the chunk if it was the last. */
     private void afterSubBox() {
+        subBoxRetries = 0;   // we're leaving this cell; the next one starts with a fresh retry budget
         if (subBoxIdx + 1 < subBoxes.size()) {
             subBoxIdx++;
             issueSubBox();
@@ -700,6 +738,7 @@ public class AquariusMinerModule extends Module {
     /** Divide the chunk's clamped XZ footprint into clearBoxSize x clearBoxSize cells (row-major). */
     private void buildSubBoxes(int x1, int z1, int x2, int z2) {
         subBoxes.clear();
+        subBoxRetries = 0;
         int s = Math.max(1, PLUGIN_CONFIG.miner.clearBoxSize);
         for (int bx = x1; bx <= x2; bx += s) {
             for (int bz = z1; bz <= z2; bz += s) {
@@ -726,6 +765,45 @@ public class AquariusMinerModule extends Module {
         clearTicks = 0;
         info("Clearing chunk [{}, {}] sub-box {}/{} y[{}..{}] {} -> {}", curCX, curCZ, subBoxIdx + 1, subBoxes.size(), y1, y2, a, b);
         BARITONE.clearArea(a, b);
+    }
+
+    // ----- verify & retry: a lag spike can leave blocks standing in a "cleared" sub-box; re-run it -----
+
+    /** If verify is on and the current sub-box still has solid blocks, re-issue it (up to clearRetries). */
+    private boolean retrySubBoxIfDirty(boolean stalled) {
+        var cfg = PLUGIN_CONFIG.miner;
+        if (!cfg.verifyClears || subBoxRetries >= cfg.clearRetries) return false;
+        if (!subBoxHasLeftovers()) return false;
+        subBoxRetries++;
+        warn("Sub-box {}/{} of chunk [{}, {}] still has blocks after {} - retry {}/{}.",
+            subBoxIdx + 1, subBoxes.size(), curCX, curCZ, stalled ? "a stall" : "clearing",
+            subBoxRetries, cfg.clearRetries);
+        issueSubBox();   // re-run the SAME cell (clearArea skips the blocks already gone)
+        return true;
+    }
+
+    /** True if any breakable solid block remains in the current sub-box's active Y band (cost-capped). */
+    private boolean subBoxHasLeftovers() {
+        if (subBoxes.isEmpty()) return false;
+        if (!World.isChunkLoadedChunkPos(curCX, curCZ)) return false;   // can't read it -> assume clean
+        int[] sb = subBoxes.get(subBoxIdx);
+        int y1 = areaLimited ? curLayerBottomY() : PLUGIN_CONFIG.miner.minY;
+        int y2 = areaLimited ? curLayerTopY      : PLUGIN_CONFIG.miner.maxY;
+        BlockPos feet = BARITONE.getPlayerContext().playerFeet();
+        long budget = 0;
+        final long BUDGET = 8192;
+        for (int x = sb[0]; x <= sb[2]; x++)
+            for (int z = sb[1]; z <= sb[3]; z++)
+                for (int y = y1; y <= y2; y++) {
+                    if (++budget > BUDGET) return false;                // too big to verify -> don't loop
+                    var b = World.getBlock(x, y, z);
+                    if (b.isAir() || World.isFluid(b)) continue;
+                    if (b.name().equals("bedrock")) continue;            // unbreakable; clearArea skips it
+                    // the bot stands on the band floor: ignore its feet + the block under them
+                    if (x == feet.x() && z == feet.z() && (y == feet.y() || y == feet.y() - 1)) continue;
+                    return true;
+                }
+        return false;
     }
 
     /**
@@ -1649,6 +1727,190 @@ public class AquariusMinerModule extends Module {
         if (restockStepTicks > PLUGIN_CONFIG.miner.storeStepTimeoutTicks) abortRestock(what + " timed out");
     }
 
+    // ------------------------------------------------ food restock cycle (best-effort)
+    // Crack a FOOD-shulker kept in the ender chest and top up the carried food. Structurally identical to the
+    // tool restock cycle (place echest -> pull the shulker out -> place + open it -> take food by preference ->
+    // break + recover the shulker -> return it to the echest -> recover the echest) but pulls FOOD, not a tool.
+    // BEST-EFFORT: if there's no food-shulker to crack, it latches foodRestockExhausted, warns, and keeps mining
+    // (food is never worth pausing the run). A genuine mechanical timeout still pauses, like the tool cycle.
+
+    private void beginFoodRestock() {
+        if (BARITONE.isActive()) BARITONE.stop();
+        areaActive = false; sawActive = false;
+        foodShulkerPos = null; foodShulkerItem = null;
+        int echestSlot = InventoryUtil.searchPlayerInventory(this::isEnderChestItem);
+        foodEchestItem = echestSlot == -1 ? null
+            : ItemRegistry.REGISTRY.get(CACHE.getPlayerCache().getPlayerInventory().get(echestSlot).getId());
+        foodEchestPos = selectStorageSpot();
+        if (foodEchestItem == null || foodEchestPos == null) { warn("Cannot restock food: no ender chest or no spot."); return; }
+        foodRestocking = true;
+        info("Food low - starting food restock cycle.");
+        setFoodPhase(FoodPhase.PLACE_ECHEST);
+    }
+
+    private void setFoodPhase(FoodPhase phase) {
+        foodPhase = phase;
+        foodStepTicks = 0;
+        Container c = CACHE.getPlayerCache().getInventoryCache().getOpenContainer();
+        switch (phase) {
+            case PLACE_ECHEST -> place(foodEchestPos, foodEchestItem);
+            case OPEN_ECHEST, REOPEN_ECHEST -> open(foodEchestPos);
+            case PLACE_SHULKER -> place(foodShulkerPos, foodShulkerItem);
+            case OPEN_SHULKER -> open(foodShulkerPos);
+            case CLOSE_ECHEST, CLOSE_SHULKER, CLOSE_ECHEST2 -> closeContainer();
+            case BREAK_SHULKER -> breakAt(foodShulkerPos);
+            case BREAK_ECHEST -> breakAt(foodEchestPos);
+            case PICKUP_SHULKER, PICKUP_ECHEST -> BARITONE.pickup();
+            case TAKE_SHULKER -> { // shift the food-shulker out of the open ender chest
+                int slot = c == null ? -1 : findContainerSlot(c, this::isFoodShulker);
+                if (slot >= 0) { foodShulkerItem = ItemRegistry.REGISTRY.get(c.getItemStack(slot).getId()); shiftClick(c, slot); }
+            }
+            case RETURN_SHULKER -> { // shift the (now part-empty) food-shulker back into the open ender chest, by TYPE
+                int slot = c == null ? -1 : findPlayerWindowSlot(c, s -> foodShulkerItem != null && matchesName(s, foodShulkerItem.name()));
+                if (slot >= 0) shiftClick(c, slot);
+            }
+            case TAKE_FOOD -> { foodTakeStall = 0; lastFoodCount = -1; } // tick-driven multi-shift below
+            default -> { /* DONE handled in foodTick */ }
+        }
+    }
+
+    private void foodTick() {
+        foodStepTicks++;
+        int openId = CACHE.getPlayerCache().getInventoryCache().getOpenContainerId();
+        switch (foodPhase) {
+            case PLACE_ECHEST -> { if (placed(foodEchestPos)) setFoodPhase(FoodPhase.OPEN_ECHEST); else timeoutFood("place ender chest"); }
+            case OPEN_ECHEST -> { if (openId != 0) setFoodPhase(FoodPhase.TAKE_SHULKER); else timeoutFood("open ender chest"); }
+            case TAKE_SHULKER -> {
+                if (InventoryUtil.searchPlayerInventory(this::isFoodShulker) != -1) { setFoodPhase(FoodPhase.CLOSE_ECHEST); return; }
+                Container c = CACHE.getPlayerCache().getInventoryCache().getOpenContainer();
+                if (c == null) { abortFood("ender chest closed early"); return; }
+                if (findContainerSlot(c, this::isFoodShulker) == -1) {
+                    // no food-shulker to crack: best-effort - stop trying this run and recover the placed echest
+                    foodRestockExhausted = true;
+                    warn("No food-shulker in the ender chest - food restock disabled for this run.");
+                    inGameAlertActivePlayer("<yellow>Aquarius Miner: no food-shulker to restock");
+                    setFoodPhase(FoodPhase.CLOSE_ECHEST2);   // close + break + pick up the echest, then resume
+                    return;
+                }
+                timeoutFood("take food-shulker");
+            }
+            case CLOSE_ECHEST -> {
+                if (openId == 0) {
+                    foodShulkerPos = selectStorageSpot();
+                    if (foodShulkerPos == null) { abortFood("no spot to place the food-shulker"); return; }
+                    setFoodPhase(FoodPhase.PLACE_SHULKER);
+                } else timeoutFood("close ender chest");
+            }
+            case PLACE_SHULKER -> { if (placed(foodShulkerPos)) setFoodPhase(FoodPhase.OPEN_SHULKER); else timeoutFood("place food-shulker"); }
+            case OPEN_SHULKER -> { if (openId != 0) setFoodPhase(FoodPhase.TAKE_FOOD); else timeoutFood("open food-shulker"); }
+            case TAKE_FOOD -> takeFoodTick();
+            case CLOSE_SHULKER -> { if (openId == 0) setFoodPhase(FoodPhase.BREAK_SHULKER); else timeoutFood("close food-shulker"); }
+            case BREAK_SHULKER -> { if (isAir(foodShulkerPos)) setFoodPhase(FoodPhase.PICKUP_SHULKER); else timeoutFood("break food-shulker"); }
+            case PICKUP_SHULKER -> { if (hasShulkerType(foodShulkerItem) || foodStepTicks > 60) setFoodPhase(FoodPhase.REOPEN_ECHEST); }
+            case REOPEN_ECHEST -> { if (openId != 0) setFoodPhase(FoodPhase.RETURN_SHULKER); else timeoutFood("reopen ender chest"); }
+            case RETURN_SHULKER -> {
+                if (!hasShulkerType(foodShulkerItem)) { setFoodPhase(FoodPhase.CLOSE_ECHEST2); return; } // shulker is back in the echest
+                Container c = CACHE.getPlayerCache().getInventoryCache().getOpenContainer();
+                if (c == null) { abortFood("ender chest closed early"); return; }
+                timeoutFood("return food-shulker");
+            }
+            case CLOSE_ECHEST2 -> { if (openId == 0) setFoodPhase(FoodPhase.BREAK_ECHEST); else timeoutFood("close ender chest"); }
+            case BREAK_ECHEST -> { if (isAir(foodEchestPos)) setFoodPhase(FoodPhase.PICKUP_ECHEST); else timeoutFood("break ender chest"); }
+            case PICKUP_ECHEST -> { if (foodStepTicks > 60 || !BARITONE.isActive()) setFoodPhase(FoodPhase.DONE); }
+            case DONE -> {
+                foodRestocking = false;
+                areaActive = false; sawActive = false;
+                info("Food restock done ({} food on hand); resuming mining.", countGoodFood());
+            }
+        }
+    }
+
+    /** Shift the highest-preference food out of the open food-shulker until we have enough (or it's empty/no room). */
+    private void takeFoodTick() {
+        var cfg = PLUGIN_CONFIG.miner;
+        int openId = CACHE.getPlayerCache().getInventoryCache().getOpenContainerId();
+        if (openId == 0) { setFoodPhase(FoodPhase.CLOSE_SHULKER); return; }
+        if (countGoodFood() >= cfg.foodRestockCount) { setFoodPhase(FoodPhase.CLOSE_SHULKER); return; }
+        Container c = CACHE.getPlayerCache().getInventoryCache().getOpenContainer();
+        int slot = c == null ? -1 : findBestFoodSlot(c);
+        if (slot == -1) { setFoodPhase(FoodPhase.CLOSE_SHULKER); return; }   // shulker out of food
+        if (!depositTimer.tick(cfg.depositDelayTicks)) return;
+        int cur = countGoodFood();
+        if (cur == lastFoodCount) {
+            if (++foodTakeStall > 6) { setFoodPhase(FoodPhase.CLOSE_SHULKER); return; } // can't unload (no room) -> stop
+        } else { foodTakeStall = 0; lastFoodCount = cur; }
+        shiftClick(c, slot);
+    }
+
+    private void abortFood(String reason) {
+        foodRestocking = false;
+        paused = true;
+        if (CACHE.getPlayerCache().getInventoryCache().getOpenContainerId() != 0) closeContainer();
+        if (BARITONE.isActive()) BARITONE.stop();
+        warn("Food restock aborted: {}. Mining paused - toggle /aquariusminer off/on to retry.", reason);
+        inGameAlertActivePlayer("<red>Aquarius Miner food restock failed: " + reason);
+    }
+
+    private void timeoutFood(String what) {
+        if (foodStepTicks > PLUGIN_CONFIG.miner.storeStepTimeoutTicks) abortFood(what + " timed out");
+    }
+
+    // ---- food predicates (ZenithProxy's FoodRegistry gives safe-food + always-eat flags per item) ----
+
+    private @Nullable FoodData foodData(@Nullable ItemStack s) {
+        if (s == null || s == Container.EMPTY_STACK) return null;
+        return FoodRegistry.REGISTRY.get(s.getId());
+    }
+
+    /** A safe, edible food (per FoodRegistry) that isn't on the risky-food denylist. */
+    private boolean isGoodFood(@Nullable ItemStack s) {
+        FoodData f = foodData(s);
+        if (f == null || !f.isSafeFood()) return false;
+        return !PLUGIN_CONFIG.miner.riskyFoods.contains(f.name());
+    }
+
+    /** Total carried good food (summed counts across main inventory + hotbar). */
+    private int countGoodFood() {
+        List<ItemStack> inv = CACHE.getPlayerCache().getPlayerInventory();
+        int n = 0;
+        for (int i = 9; i <= 44; i++) { ItemStack s = inv.get(i); if (isGoodFood(s)) n += s.getAmount(); }
+        return n;
+    }
+
+    /** Preference rank (lower = better): golden carrot > ench golden apple > golden apple/always-eat > cooked > other. */
+    private int foodPriority(@Nullable ItemStack s) {
+        String n = itemName(s);
+        if (n == null) return Integer.MAX_VALUE;
+        if (n.equals("golden_carrot")) return 1;
+        if (n.equals("enchanted_golden_apple")) return 2;
+        if (n.equals("golden_apple")) return 3;
+        FoodData f = foodData(s);
+        if (f != null && f.canAlwaysEat()) return 3;   // other always-eat foods rank with the golden apple
+        if (n.startsWith("cooked_") || n.equals("bread") || n.equals("baked_potato")) return 4;
+        return 5;                                       // natural / other safe foods
+    }
+
+    /** Container (chest-half) slot holding the highest-preference food, or -1. */
+    private int findBestFoodSlot(Container c) {
+        int chestSlots = Math.max(0, c.getSize() - 36);
+        int best = -1, bestPri = Integer.MAX_VALUE;
+        for (int i = 0; i < chestSlots; i++) {
+            ItemStack s = c.getItemStack(i);
+            if (!isGoodFood(s)) continue;
+            int pri = foodPriority(s);
+            if (pri < bestPri) { bestPri = pri; best = i; }
+        }
+        return best;
+    }
+
+    /** A shulker box item whose CONTAINER contents include good food. */
+    private boolean isFoodShulker(@Nullable ItemStack s) {
+        String n = itemName(s);
+        if (n == null || !n.endsWith("shulker_box")) return false;
+        for (ItemStack inner : containerContents(s)) if (isGoodFood(inner)) return true;
+        return false;
+    }
+
     // ---- restock primitives + predicates ----
 
     private void place(@Nullable BlockPos pos, @Nullable ItemData item) {
@@ -1832,8 +2094,10 @@ public class AquariusMinerModule extends Module {
         return false;
     }
 
-    /** A FILLED loot shulker (has contents) that is NOT the tool-shulker - i.e. mined haul to haul off. */
-    private boolean isLootFilledShulker(@Nullable ItemStack s) { return isFilledShulker(s) && !isToolBearingShulker(s); }
+    /** A FILLED loot shulker (has contents) that is NOT the tool- or food-shulker - i.e. mined haul to haul off. */
+    private boolean isLootFilledShulker(@Nullable ItemStack s) {
+        return isFilledShulker(s) && !isToolBearingShulker(s) && !isFoodShulker(s);
+    }
 
     private @Nullable String itemName(@Nullable ItemStack stack) {
         if (stack == null || stack == Container.EMPTY_STACK) return null;
@@ -1863,6 +2127,7 @@ public class AquariusMinerModule extends Module {
         if (storing) return "Storing (" + storePhase + ")";
         if (echestCycle) return "Buffering (" + echestPhase + ")";
         if (restocking) return "Restocking (" + restockPhase + ")";
+        if (foodRestocking) return "Food restock (" + foodPhase + ")";
         if (depositing) return "Depositing (" + depositPhase + ")";
         if (areaLimited) return "Mining [" + curCX + ", " + curCZ + "] " + areaChunksDone + "/" + areaChunksTotal;
         return "Mining [" + curCX + ", " + curCZ + "]";
