@@ -79,6 +79,11 @@ public class AquariusMinerModule extends Module {
     private int savedMaxFall;
     private boolean savedParkour, savedParkourPlace, savedDiagDescend, savedDiagAscend;
 
+    // live re-anchor: an area command (e.g. '.aqm here L W') sets the area config on the command thread and
+    // raises this flag; the TICK thread re-resolves the area + re-seeds the spiral, so there's no cross-thread
+    // mutation of the spiral state.
+    private volatile boolean reanchorRequested = false;
+
     // mining state machine
     private boolean areaActive = false; // we've asked clearArea to run for (curCX,curCZ)
     private boolean sawActive = false;  // we've observed Baritone pick the clear up (1-tick lag guard)
@@ -453,6 +458,16 @@ public class AquariusMinerModule extends Module {
     private void onTick(ClientBotTick event) {
         var cfg = PLUGIN_CONFIG.miner;
         if (!CACHE.getPlayerCache().isAlive()) return;
+        // an area command asked us to re-anchor: re-resolve the area + re-seed here, now. Deferred while a
+        // container cycle is mid-flight (so we never strand a placed shulker/echest); still fires while
+        // paused/complete so the command can redirect a stuck or finished bot.
+        if (reanchorRequested && !storing && !echestCycle && !restocking && !foodRestocking && !depositing) {
+            reanchorRequested = false;
+            if (BARITONE.isActive()) BARITONE.stop();
+            info("Re-anchoring to a new area (command).");
+            resetToStart();
+            return;
+        }
         if (complete || paused) return;
 
         // storage / echest / restock / deposit cycles take over the bot entirely while they run
@@ -2106,6 +2121,14 @@ public class AquariusMinerModule extends Module {
     }
 
     // --------------------------------------------------- status accessors
+
+    /**
+     * Ask the mining loop to re-resolve the area + re-anchor the spiral on the NEXT tick (thread-safe). Called
+     * by area commands after they write new area config, so a change takes effect live without an off/on toggle.
+     */
+    public void requestReanchor() {
+        reanchorRequested = true;
+    }
 
     public boolean isPaused() {
         return paused;
