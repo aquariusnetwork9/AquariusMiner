@@ -12,6 +12,7 @@ import com.zenith.feature.inventory.actions.DropItem;
 import com.zenith.feature.inventory.actions.ShiftClick;
 import com.zenith.feature.inventory.util.InventoryUtil;
 import com.zenith.feature.pathfinder.goals.GoalNear;
+import com.zenith.feature.pathfinder.util.RotationUtils;
 import com.zenith.feature.player.World;
 import com.zenith.mc.block.BlockPos;
 import com.zenith.mc.food.FoodData;
@@ -94,6 +95,17 @@ public class AquariusMinerModule extends Module {
     private final java.util.List<int[]> subBoxes = new java.util.ArrayList<>();
     private int subBoxIdx = 0;
     private int subBoxRetries = 0;      // re-runs of the current sub-box after a verify found leftovers (1.3.2 port)
+
+    // legit (line-of-sight) break driver: when legitMine is on, the plugin breaks blocks ITSELF - only ones the
+    // bot can actually SEE (RotationUtils.reachable) - instead of letting clearArea ghost-hand through walls.
+    private boolean legitActive = false;             // a sub-box is being cleared by the legit driver
+    private @Nullable BlockPos legitBreakPos = null; // the block currently being broken
+    private int legitBreakTicks = 0;                 // ghost-block / stuck cap on the current block
+    private int legitRepathTicks = 0;                // ticks spent repositioning to get a sightline
+    private final java.util.Set<Long> legitSkip = new java.util.HashSet<>(); // blocks given up on (verify re-runs the box)
+    private static final int LEGIT_BREAK_TICKS = 20 * 12;  // 12s stuck on one block (deepslate is slow) -> skip as ghost
+    private static final int LEGIT_REPATH_TICKS = 20 * 8;  // 8s trying to get a sightline on a block -> skip it
+    private static final int LEGIT_SCAN_REACH_CHECKS = 32; // cap raycasts per target pick (nearest-first)
     private boolean paused = false;     // hard pause (inventory full + can't store) -> needs toggle
     private boolean hazardPaused = false; // soft pause (player nearby) -> auto-resumes when clear
     private boolean complete = false;   // the run finished (finite area fully cleared)
@@ -230,6 +242,9 @@ public class AquariusMinerModule extends Module {
         if (BARITONE.isActive()) BARITONE.stop();
         areaActive = false;
         sawActive = false;
+        legitActive = false;
+        legitBreakPos = null;
+        legitSkip.clear();
         storing = false;
         echestCycle = false;
         echestExhausted = false;
@@ -290,6 +305,7 @@ public class AquariusMinerModule extends Module {
         resolveArea(px >> 4, pz >> 4);
         seedSpiral();
         areaActive = false; sawActive = false; clearTicks = 0; subBoxRetries = 0;
+        legitActive = false; legitBreakPos = null; legitBreakTicks = 0; legitRepathTicks = 0; legitSkip.clear();
         storing = false; restocking = false; storePos = null; storeItem = null;
         foodRestocking = false; foodRestockExhausted = false; foodEchestPos = null; foodShulkerPos = null;
         echestCycle = false; echestExhausted = false; finishAfterEchest = false; echPos = null; shulkPos = null;
@@ -550,6 +566,14 @@ public class AquariusMinerModule extends Module {
         }
 
         // 3) mining drive
+        // legit engine: the plugin breaks line-of-sight blocks itself (no clearArea ghost-hand)
+        if (cfg.legitMine) {
+            if (legitActive) { legitClearTick(); return; }
+            if (!mineTimer.tick(cfg.delayTicks)) return;
+            startClear(curCX, curCZ);
+            return;
+        }
+        // fast engine: hand the sub-box to clearArea (can reach through walls)
         if (areaActive) {
             if (!sawActive) {
                 if (BARITONE.isActive()) {
@@ -604,7 +628,7 @@ public class AquariusMinerModule extends Module {
         collectTargetTicks = 0;
         collectTotalTicks = 0;
         collectSkip.clear();
-        areaActive = false; sawActive = false;   // the builder is done with this box
+        areaActive = false; sawActive = false; legitActive = false;   // the builder/legit driver is done with this box
         info("Vacuuming drops in sub-box {}/{}.", subBoxIdx + 1, subBoxes.size());
     }
 
@@ -773,6 +797,14 @@ public class AquariusMinerModule extends Module {
         int[] sb = subBoxes.get(subBoxIdx);
         int y1 = areaLimited ? curLayerBottomY() : cfg.minY;
         int y2 = areaLimited ? curLayerTopY      : cfg.maxY;
+        if (cfg.legitMine) {
+            legitActive = true;
+            legitBreakPos = null; legitBreakTicks = 0; legitRepathTicks = 0;
+            legitSkip.clear();
+            clearTicks = 0;
+            info("Clearing (legit) chunk [{}, {}] sub-box {}/{} y[{}..{}]", curCX, curCZ, subBoxIdx + 1, subBoxes.size(), y1, y2);
+            return;
+        }
         BlockPos a = new BlockPos(sb[0], y1, sb[1]);
         BlockPos b = new BlockPos(sb[2], y2, sb[3]);
         areaActive = true;
@@ -780,6 +812,122 @@ public class AquariusMinerModule extends Module {
         clearTicks = 0;
         info("Clearing chunk [{}, {}] sub-box {}/{} y[{}..{}] {} -> {}", curCX, curCZ, subBoxIdx + 1, subBoxes.size(), y1, y2, a, b);
         BARITONE.clearArea(a, b);
+    }
+
+    // ----- legit (line-of-sight) break driver -----
+    // Break only blocks the bot can actually SEE, one at a time, repositioning when none is in view, so a
+    // quarry mines from exposed faces inward like a player would (no ghost-hand). Reuses the proven break-and-
+    // poll pattern (call breakBlock, poll the block to air). Skips/repath-timeouts feed verify-retry.
+
+    private void legitClearTick() {
+        var cfg = PLUGIN_CONFIG.miner;
+        clearTicks++;
+
+        // overall cap (parity with the fast engine's maxClearTicks) -> verify-retry, then advance
+        if (clearTicks > cfg.maxClearTicks) {
+            warn("Chunk [{}, {}] sub-box {}/{} (legit) timed out after {} ticks.",
+                curCX, curCZ, subBoxIdx + 1, subBoxes.size(), clearTicks);
+            endLegitSubBox();
+            if (retrySubBoxIfDirty(true)) return;
+            afterSubBox();
+            return;
+        }
+
+        // 1) a block is mid-break: wait for it to vanish (with a ghost-block / stuck cap)
+        if (legitBreakPos != null) {
+            if (isAir(legitBreakPos)) {
+                legitBreakPos = null; legitBreakTicks = 0;          // broken -> pick the next this tick
+            } else if (++legitBreakTicks > LEGIT_BREAK_TICKS) {
+                legitSkip.add(packPos(legitBreakPos));               // stuck/ghost -> skip (verify re-runs the box)
+                legitBreakPos = null; legitBreakTicks = 0;
+                if (BARITONE.isActive()) BARITONE.stop();
+            } else {
+                return;                                              // keep digging
+            }
+        }
+
+        // 2) break the nearest block the bot can actually SEE
+        BlockPos los = nearestLineOfSightBlock();
+        if (los != null) {
+            legitBreakPos = los;
+            legitBreakTicks = 0;
+            legitRepathTicks = 0;
+            BARITONE.breakBlock(los.x(), los.y(), los.z(), true);
+            return;
+        }
+
+        // 3) nothing visible: if blocks remain, walk to get a sightline; else the box is clear
+        BlockPos remaining = nearestSolidBlock();
+        if (remaining == null) {
+            endLegitSubBox();
+            if (retrySubBoxIfDirty(false)) return;
+            beginCollect();
+            return;
+        }
+        if (++legitRepathTicks > LEGIT_REPATH_TICKS) {
+            legitSkip.add(packPos(remaining));                       // can't get a sightline in time -> skip
+            legitRepathTicks = 0;
+            if (BARITONE.isActive()) BARITONE.stop();
+            return;
+        }
+        if (!BARITONE.isActive()) BARITONE.pathTo(new GoalNear(remaining.x(), remaining.y(), remaining.z(), 9));
+    }
+
+    private void endLegitSubBox() {
+        legitActive = false;
+        legitBreakPos = null;
+        legitBreakTicks = 0;
+        legitRepathTicks = 0;
+        legitSkip.clear();
+        if (BARITONE.isActive()) BARITONE.stop();
+    }
+
+    /** Nearest solid block in the current sub-box that the bot has a real line of sight to, or null. */
+    private @Nullable BlockPos nearestLineOfSightBlock() {
+        var ctx = BARITONE.getPlayerContext();
+        java.util.List<BlockPos> solids = collectSubBoxSolids();
+        int checks = 0;
+        for (BlockPos p : solids) {
+            if (++checks > LEGIT_SCAN_REACH_CHECKS) break;           // bound raycasts; the rest wait their turn
+            if (RotationUtils.reachable(ctx, p).isPresent()) return p;
+        }
+        return null;
+    }
+
+    /** Nearest solid (breakable, non-skipped) block in the current sub-box, ignoring sightline, or null. */
+    private @Nullable BlockPos nearestSolidBlock() {
+        java.util.List<BlockPos> solids = collectSubBoxSolids();
+        return solids.isEmpty() ? null : solids.get(0);
+    }
+
+    /** Solid, breakable, non-skipped blocks in the current sub-box's active Y band, nearest-first to the bot. */
+    private java.util.List<BlockPos> collectSubBoxSolids() {
+        java.util.List<BlockPos> out = new java.util.ArrayList<>();
+        if (subBoxes.isEmpty() || !World.isChunkLoadedChunkPos(curCX, curCZ)) return out;
+        int[] sb = subBoxes.get(subBoxIdx);
+        int y1 = areaLimited ? curLayerBottomY() : PLUGIN_CONFIG.miner.minY;
+        int y2 = areaLimited ? curLayerTopY      : PLUGIN_CONFIG.miner.maxY;
+        for (int x = sb[0]; x <= sb[2]; x++)
+            for (int z = sb[1]; z <= sb[3]; z++)
+                for (int y = y1; y <= y2; y++) {
+                    var b = World.getBlock(x, y, z);
+                    if (b.isAir() || World.isFluid(b) || b.destroySpeed() < 0) continue; // air/fluid/unbreakable
+                    if (legitSkip.contains(packPos(x, y, z))) continue;
+                    out.add(new BlockPos(x, y, z));
+                }
+        BlockPos feet = BARITONE.getPlayerContext().playerFeet();
+        out.sort((p, q) -> Long.compare(distSq(feet, p), distSq(feet, q)));
+        return out;
+    }
+
+    private static long distSq(BlockPos a, BlockPos b) {
+        long dx = a.x() - b.x(), dy = a.y() - b.y(), dz = a.z() - b.z();
+        return dx * dx + dy * dy + dz * dz;
+    }
+
+    private static long packPos(BlockPos p) { return packPos(p.x(), p.y(), p.z()); }
+    private static long packPos(int x, int y, int z) {
+        return ((long) (x & 0x3FFFFFF) << 38) | ((long) (z & 0x3FFFFFF) << 12) | (y & 0xFFF);
     }
 
     // ----- verify & retry: a lag spike can leave blocks standing in a "cleared" sub-box; re-run it -----
@@ -2152,7 +2300,8 @@ public class AquariusMinerModule extends Module {
         if (restocking) return "Restocking (" + restockPhase + ")";
         if (foodRestocking) return "Food restock (" + foodPhase + ")";
         if (depositing) return "Depositing (" + depositPhase + ")";
-        if (areaLimited) return "Mining [" + curCX + ", " + curCZ + "] " + areaChunksDone + "/" + areaChunksTotal;
-        return "Mining [" + curCX + ", " + curCZ + "]";
+        String eng = PLUGIN_CONFIG.miner.legitMine ? " (legit)" : "";
+        if (areaLimited) return "Mining [" + curCX + ", " + curCZ + "]" + eng + " " + areaChunksDone + "/" + areaChunksTotal;
+        return "Mining [" + curCX + ", " + curCZ + "]" + eng;
     }
 }
