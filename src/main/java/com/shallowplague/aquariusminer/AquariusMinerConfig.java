@@ -164,6 +164,17 @@ public class AquariusMinerConfig {
          */
         public int maxClearTicks = 3600;
 
+        /**
+         * After a sub-box clears (or times out), VERIFY it: scan that cell for any solid blocks still
+         * standing. A lag spike / desync can make clearArea report a box DONE (or give up on the stall
+         * cap) with blocks left, leaving gaps. If leftovers are found, re-issue the SAME sub-box up to
+         * {@link #clearRetries} times before moving on.
+         */
+        public boolean verifyClears = true;
+
+        /** Max times to re-run a sub-box that still has blocks after a clear/stall (see {@link #verifyClears}). */
+        public int clearRetries = 2;
+
         // --- drop collection ---
 
         /**
@@ -296,5 +307,23 @@ public class AquariusMinerConfig {
          * {@link #restockToolKeyword} is already "shovel", this does nothing.
          */
         public boolean alsoRestockShovel = true;
+
+        // --- food restock ---
+        // 2b bots keep food (golden carrots, enchanted/normal golden apples, cooked meat) in a FOOD-SHULKER
+        // inside the ender chest. The built-in AutoEat module eats it; this tops it up. When the carried food
+        // drops below {@link #minFoodOnHand} the bot cracks that food-shulker - the SAME place/open/take/break/
+        // return cycle as the tool-shulker - and refills by preference: golden carrot > enchanted golden apple
+        // > golden apple > cooked > other safe food (safety per ZenithProxy's food registry; risky foods are
+        // never taken). It triggers on COUNT, not hunger, so food is staged before AutoEat goes hungry.
+        // BEST-EFFORT: with no food-shulker in the ender chest the bot just warns and keeps mining (no pause).
+
+        /** Restock food from a FOOD-SHULKER in the ender chest when the carried food runs low. */
+        public boolean restockFood = false;
+
+        /** Trigger the food restock when the total carried (safe) food drops below this count. 1 = last bite. */
+        public int minFoodOnHand = 1;
+
+        /** Take food from the shulker until the carried (safe) food reaches this count (or the shulker empties). */
+        public int foodRestockCount = 64;
     }
 }

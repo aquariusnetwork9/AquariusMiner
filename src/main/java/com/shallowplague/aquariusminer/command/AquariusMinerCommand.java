@@ -42,8 +42,10 @@ public class AquariusMinerCommand extends Command {
                 "pauseplayer on/off",
                 "restock on/off",
                 "shovel on/off",
+                "food on/off | food count <n> | food min <n>",
                 "clearbox <size>",
                 "layer <blocks>",
+                "verify on/off | verify retries <n>",
                 "collect on/off | collect seconds <n>",
                 "scan",
                 "deposit on/off",
@@ -178,6 +180,28 @@ public class AquariusMinerCommand extends Command {
                 PLUGIN_CONFIG.miner.alsoRestockShovel = getToggle(c, "toggle");
                 c.getSource().getEmbed().title("Also restock shovel " + toggleStrCaps(PLUGIN_CONFIG.miner.alsoRestockShovel));
             })))
+            .then(literal("food")
+                .then(argument("toggle", toggle()).executes(c -> {
+                    PLUGIN_CONFIG.miner.restockFood = getToggle(c, "toggle");
+                    c.getSource().getEmbed().title("Food restock " + toggleStrCaps(PLUGIN_CONFIG.miner.restockFood));
+                }))
+                .then(literal("count").then(argument("n", integer(1)).executes(c -> {
+                    PLUGIN_CONFIG.miner.foodRestockCount = getInteger(c, "n");
+                    c.getSource().getEmbed().title("Food restock target: " + getInteger(c, "n"));
+                })))
+                .then(literal("min").then(argument("n", integer(1)).executes(c -> {
+                    PLUGIN_CONFIG.miner.minFoodOnHand = getInteger(c, "n");
+                    c.getSource().getEmbed().title("Restock food when carried food < " + getInteger(c, "n"));
+                }))))
+            .then(literal("verify")
+                .then(argument("toggle", toggle()).executes(c -> {
+                    PLUGIN_CONFIG.miner.verifyClears = getToggle(c, "toggle");
+                    c.getSource().getEmbed().title("Verify clears " + toggleStrCaps(PLUGIN_CONFIG.miner.verifyClears));
+                }))
+                .then(literal("retries").then(argument("n", integer(0)).executes(c -> {
+                    PLUGIN_CONFIG.miner.clearRetries = getInteger(c, "n");
+                    c.getSource().getEmbed().title("Sub-box clear retries: " + getInteger(c, "n"));
+                }))))
             .then(literal("scan").executes(c -> {
                 MODULE.get(AquariusMinerModule.class).printScan();
                 c.getSource().getEmbed().title("Resource scan printed to console + in-game alert");
@@ -250,9 +274,13 @@ public class AquariusMinerCommand extends Command {
                 ? "on (" + PLUGIN_CONFIG.miner.restockToolKeyword + " < " + PLUGIN_CONFIG.miner.restockBelowDurability + ")"
                     + (PLUGIN_CONFIG.miner.alsoRestockShovel ? " +shovel" : "")
                 : "off")
+            .addField("Food", PLUGIN_CONFIG.miner.restockFood
+                ? "on (restock to " + PLUGIN_CONFIG.miner.foodRestockCount + " when < " + PLUGIN_CONFIG.miner.minFoodOnHand + ")"
+                : "off")
             .addField("Collection", "clear-box " + PLUGIN_CONFIG.miner.clearBoxSize
                 + ", layer " + PLUGIN_CONFIG.miner.layerHeight
-                + ", vacuum " + toggleStr(PLUGIN_CONFIG.miner.collectDrops))
+                + ", vacuum " + toggleStr(PLUGIN_CONFIG.miner.collectDrops)
+                + ", verify " + (PLUGIN_CONFIG.miner.verifyClears ? "on (" + PLUGIN_CONFIG.miner.clearRetries + " retries)" : "off"))
             .addField("Deposit", PLUGIN_CONFIG.miner.depositToChests
                 ? "on (" + PLUGIN_CONFIG.miner.depositChests.size() + " deposit, "
                     + PLUGIN_CONFIG.miner.supplyChests.size() + " supply"
