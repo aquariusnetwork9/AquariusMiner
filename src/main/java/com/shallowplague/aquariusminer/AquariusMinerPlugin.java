@@ -2,6 +2,7 @@ package com.shallowplague.aquariusminer;
 
 import com.shallowplague.aquariusminer.command.AquariusMinerCommand;
 import com.shallowplague.aquariusminer.module.AquariusMinerModule;
+import com.shallowplague.aquariusminer.module.PacketSnifferModule;
 import com.zenith.plugin.api.Plugin;
 import com.zenith.plugin.api.PluginAPI;
 import com.zenith.plugin.api.ZenithProxyPlugin;
@@ -27,6 +28,7 @@ public class AquariusMinerPlugin implements ZenithProxyPlugin {
         // config must exist before the module or command reads it
         PLUGIN_CONFIG = pluginAPI.registerConfig(BuildConstants.PLUGIN_ID, AquariusMinerConfig.class);
         pluginAPI.registerModule(new AquariusMinerModule());
+        pluginAPI.registerModule(new PacketSnifferModule());
         pluginAPI.registerCommand(new AquariusMinerCommand());
         LOG.info("Aquarius Miner plugin loaded!");
     }

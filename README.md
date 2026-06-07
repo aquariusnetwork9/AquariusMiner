@@ -57,31 +57,104 @@ restart the proxy. Plugins are only supported on the `java` release channel.
 
 ## Commands
 
-`/aquariusminer` (category: MODULE)
+`/aquariusminer` (category: MODULE). Short alias: **`.aqm`** (e.g. `.aqm on`, `.aqm here 2 4`).
 
 | Usage | Description |
 | --- | --- |
 | `aquariusminer on` / `off` | Enable / disable the miner |
 | `aquariusminer minY <y>` | Lowest Y level to mine (inclusive) |
 | `aquariusminer maxY <y>` | Highest Y level to mine (inclusive) |
+| `aquariusminer here <length> <width>` | Set the box from the bot's **position + facing**: `<length>` chunks forward, `<width>` chunks right (re-anchors live if running) |
 | `aquariusminer area unlimited` | Infinite outward spiral (no bound) |
 | `aquariusminer area chunks <w> <l>` | Finite W×L chunk box from the start chunk |
 | `aquariusminer area anchor center/corner` | Box centred on you, or grown from a corner toward your facing |
 | `aquariusminer area corners <x1> <z1> <x2> <z2>` | Finite box between two X/Z coords (Y = the band) |
+| `aquariusminer keep add/remove <item>` / `list` / `clear` / `reset` | Edit the kept-block list at runtime (mine other ores/blocks); matches **item** names |
+| `aquariusminer legit on` / `off` | Break only blocks in line of sight (no reaching through walls); off = faster batch engine |
 | `aquariusminer cave on` / `off` | Relax pathfinder fall/jump limits to mine through caves |
 | `aquariusminer clearbox <size>` | Drop-collection sub-box size (smaller = more thorough, slower) |
 | `aquariusminer layer <blocks>` | Top-down layer thickness for a bounded area (1 = peel one level across the whole area) |
 | `aquariusminer collect on/off` / `seconds <n>` | Vacuum dropped keep-items after each sub-box; per-box time cap |
+| `aquariusminer verify on/off` / `retries <n>` | Re-run a sub-box that still has blocks after a clear/stall (lag gaps) |
 | `aquariusminer shovel on/off` | Also keep a fresh shovel stocked (alongside the main tool) for gravel/sand |
+| `aquariusminer restock on/off` | Restock a fresh tool from a tool-shulker in the ender chest |
+| `aquariusminer food on/off` / `count <n>` / `min <n>` | Restock food from a food-shulker in the ender chest when carried food runs low |
 | `aquariusminer scan` | Re-print the last pre-mine resource scan (top blocks + ores) |
+| `aquariusminer sniff …` | Packet sniffer — see [Packet sniffer](#packet-sniffer) below |
 | `aquariusminer deposit on` / `off` | Haul filled shulkers to base chests instead of leaving them behind |
 | `aquariusminer deposit chest add <x> <y> <z>` / `clear` | DEPOSIT chest(s) — where FILLED shulkers go |
 | `aquariusminer deposit supply add <x> <y> <z>` / `clear` | SUPPLY chest(s) — where EMPTY shulkers come from |
 | `aquariusminer deposit refill on/off` / `empties <n>` / `maxdist <b>` | Empty refills (capped to echest room), distance cap |
-| `aquariusminer` | Show status (state, Y band, area, cave, collection, deposit, current chunk) |
+| `aquariusminer` | Show status (state, Y band, area, cave, collection, deposit, sniffer, current chunk) |
 
 Position the bot inside (or above) the target layer, set the `minY`/`maxY` band (default `-59 .. -50`,
-just above bedrock in the 1.21 deepslate layer), then `/aquariusminer on`.
+just above bedrock in the 1.21 deepslate layer), then `/aquariusminer on` (or `.aqm on`).
+
+## Packet sniffer
+
+A built-in debug tool to watch packets between the bot and the server. It taps ZenithProxy's **client
+registry** (the bot ↔ remote-server connection), so:
+
+- **inbound** = packets received **from the server** (clientbound),
+- **outbound** = packets the bot **sends to the server** (serverbound).
+
+It's a **separate toggle** from the miner (capture whether or not you're mining). Enabling it registers the
+capture codec; disabling unregisters it, so there's **zero per-packet overhead when off**. Captured lines go
+into a **rolling buffer that keeps only the most recent `sniffBufferLines` (default 250)** — oldest lines are
+evicted, so it never grows unbounded — and you print it on demand with `sniff dump`. `sniff live on` also logs
+each packet as it arrives. (This is independent of ZenithProxy's own `/debug packetLog`.)
+
+### Sniffer commands
+
+| Usage | Description |
+| --- | --- |
+| `aquariusminer sniff on` / `off` | Start / stop capturing into the rolling buffer |
+| `aquariusminer sniff dump` | Print the buffered lines to the console / terminal |
+| `aquariusminer sniff clear` | Empty the buffer |
+| `aquariusminer sniff 1s` / `3s` / `5s` / `10s` | **Timed verbose capture**: clears the buffer, captures live + full body for N seconds, then auto-dumps and stops |
+| `aquariusminer sniff live on` / `off` | Also log each packet live as it arrives (vs. buffer-only) |
+| `aquariusminer sniff body on` / `off` | Capture full packet contents vs. just the class name |
+| `aquariusminer sniff dir in` / `out` / `both` | Capture only inbound, only outbound, or both |
+| `aquariusminer sniff filter <text>` / `off` | Only packets whose class name contains `<text>` (case-insensitive) |
+| `aquariusminer sniff template <name>` / `list` / `off` | Limit capture to a scenario group (below) |
+
+### Scenario templates
+
+A template restricts capture to a group of related packets (matched as substrings of the packet class
+name). Combine a template with `filter` to narrow further (e.g. `template entities` + `filter add`).
+
+| Template | Captures (packet-name substrings) |
+| --- | --- |
+| `movement` | playerposition, moveplayer, moveentity, teleport, rotate, velocity, vehiclemove, setentitymotion |
+| `combat` | damage, hurt, interact, sethealth, entityevent, removeentities, attack |
+| `inventory` | container, setslot, setcontent, openscreen, carrieditem, creativemodeslot, setheldslot |
+| `blocks` | blockupdate, blockdestruction, playeraction, useitem, blockchangedack, blockevent, sectionblocks |
+| `chunks` | levelchunk, forgetlevelchunk, chunkcachecenter, chunkcacheradius, lightupdate |
+| `chat` | chat, systemchat, disguised, playerinfo |
+| `entities` | addentity, removeentities, setentitydata, moveentity, teleportentity, entityevent |
+| `keepalive` | keepalive, ping, pong |
+
+### Filtering by packet type
+
+The `filter` is a case-insensitive substring of the packet **class simple name**, e.g. mcprotocollib's
+`ClientboundBlockUpdatePacket`, `ServerboundPlayerActionPacket`, `ClientboundSetEntityMotionPacket`. So
+`filter blockupdate` shows block changes, `filter playeraction` shows the bot's dig/place actions,
+`filter keepalive` shows pings. To discover exact names, run a short `sniff 3s` with no filter and read the
+class names in the dump, then re-run with `filter <name>`.
+
+### Examples
+
+```
+.aqm sniff 5s                          # quick verbose 5-second capture, auto-dumped
+.aqm sniff template movement
+.aqm sniff on                          # rolling 250-line buffer of movement packets
+# … reproduce the issue …
+.aqm sniff dump                        # print what just happened
+.aqm sniff off
+.aqm sniff template blocks
+.aqm sniff filter playeraction
+.aqm sniff 10s                         # 10s of just the bot's block-break actions
+```
 
 ## Configuration
 
@@ -98,6 +171,11 @@ Stored as JSON under ZenithProxy's plugin config dir (key `aquarius-miner`). Fie
 - `clearBoxSize` (drop-collection sub-box size; 16 = whole chunk at once)
 - `depositToChests`, `depositChests` / `supplyChests` (`"x y z"` lists),
   `refillEmpties`, `emptiesPerTrip`, `maxDepositDistance`
+- `legitMine` (break only line-of-sight blocks), `verifyClears` / `clearRetries`
+- `restockTools` / `restockToolKeyword` / `restockBelowDurability` / `alsoRestockShovel`,
+  `restockFood` / `minFoodOnHand` / `foodRestockCount`
+- `sniffEnabled`, `sniffLive`, `sniffBody`, `sniffDir` (`in`/`out`/`both`), `sniffFilter`,
+  `sniffTemplate`, `sniffBufferLines` (rolling buffer size, default 250)
 
 ## Status / roadmap
 
