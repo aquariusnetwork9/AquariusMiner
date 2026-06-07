@@ -43,6 +43,7 @@ public class AquariusMinerCommand extends Command {
                 "area corners <x1> <z1> <x2> <z2>",
                 "keep add <item> | remove <item> | list | clear | reset",
                 "cave on/off",
+                "legit on/off  (break only blocks in line of sight)",
                 "fullstacks on/off",
                 "badfood on/off",
                 "autodc on/off",
@@ -216,6 +217,14 @@ public class AquariusMinerCommand extends Command {
                 c.getSource().getEmbed()
                     .title("Cave handling " + toggleStrCaps(PLUGIN_CONFIG.miner.caveHandling));
             })))
+            .then(literal("legit").then(argument("toggle", toggle()).executes(c -> {
+                PLUGIN_CONFIG.miner.legitMine = getToggle(c, "toggle");
+                c.getSource().getEmbed()
+                    .title("Legit mining " + toggleStrCaps(PLUGIN_CONFIG.miner.legitMine))
+                    .description(PLUGIN_CONFIG.miner.legitMine
+                        ? "Breaks only blocks the bot can see (no reaching through walls)."
+                        : "Fast engine - may reach through walls to occluded blocks.");
+            })))
             .then(literal("fullstacks").then(argument("toggle", toggle()).executes(c -> {
                 PLUGIN_CONFIG.miner.requireFullStacks = getToggle(c, "toggle");
                 c.getSource().getEmbed()
@@ -360,6 +369,7 @@ public class AquariusMinerCommand extends Command {
                 + (PLUGIN_CONFIG.miner.dropBadFood ? " (+bad food)" : ""))
             .addField("Cave Handling", toggleStr(PLUGIN_CONFIG.miner.caveHandling)
                 + (PLUGIN_CONFIG.miner.caveHandling ? " (fall " + PLUGIN_CONFIG.miner.maxFallHeight + ")" : ""))
+            .addField("Mining", PLUGIN_CONFIG.miner.legitMine ? "legit (line of sight)" : "fast (can reach through walls)")
             .addField("Storage", toggleStr(PLUGIN_CONFIG.miner.storageEnabled)
                 + (PLUGIN_CONFIG.miner.requireFullStacks ? " (full stacks)" : " (margin " + PLUGIN_CONFIG.miner.freeSlotsBeforeFull + ")")
                 + (PLUGIN_CONFIG.miner.breakAndCollect ? ", break & collect" : ", leave"))

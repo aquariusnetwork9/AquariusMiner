@@ -175,6 +175,17 @@ public class AquariusMinerConfig {
         /** Max times to re-run a sub-box that still has blocks after a clear/stall (see {@link #verifyClears}). */
         public int clearRetries = 2;
 
+        // --- mining style ---
+
+        /**
+         * LEGIT mining (line-of-sight). On (default), the bot breaks ONLY blocks it can actually see - the
+         * same reach/sightline the server enforces - instead of letting the quarry engine "ghost-hand" through
+         * walls to occluded blocks. It breaks the nearest visible block and repositions when none is in view,
+         * so a quarry mines from exposed faces inward like a player would. Turn OFF for the faster batch engine
+         * (which can reach through blocks) when looking legit doesn't matter. Slightly slower while on.
+         */
+        public boolean legitMine = true;
+
         // --- drop collection ---
 
         /**
