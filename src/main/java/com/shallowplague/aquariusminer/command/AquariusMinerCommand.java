@@ -1,6 +1,8 @@
 package com.shallowplague.aquariusminer.command;
 
 import com.shallowplague.aquariusminer.module.AquariusMinerModule;
+import com.shallowplague.aquariusminer.module.PacketSniffer;
+import com.shallowplague.aquariusminer.module.PacketSnifferModule;
 import com.shallowplague.aquariusminer.AquariusMinerConfig.AreaAnchor;
 import com.shallowplague.aquariusminer.AquariusMinerConfig.AreaMode;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
@@ -56,6 +58,9 @@ public class AquariusMinerCommand extends Command {
                 "verify on/off | verify retries <n>",
                 "collect on/off | collect seconds <n>",
                 "scan",
+                "sniff on/off | dump | clear | 1s | 3s | 5s | 10s",
+                "sniff live on/off | body on/off | dir in/out/both",
+                "sniff filter <text>/off | template <name>/list/off",
                 "deposit on/off",
                 "deposit chest add <x> <y> <z> | clear",
                 "deposit supply add <x> <y> <z> | clear",
@@ -299,6 +304,76 @@ public class AquariusMinerCommand extends Command {
                 MODULE.get(AquariusMinerModule.class).printScan();
                 c.getSource().getEmbed().title("Resource scan printed to console + in-game alert");
             }))
+            .then(literal("sniff")
+                .then(argument("toggle", toggle()).executes(c -> {
+                    PLUGIN_CONFIG.miner.sniffEnabled = getToggle(c, "toggle");
+                    MODULE.get(PacketSnifferModule.class).syncEnabledFromConfig();
+                    c.getSource().getEmbed()
+                        .title("Packet sniffer " + toggleStrCaps(PLUGIN_CONFIG.miner.sniffEnabled))
+                        .description("Captures bot<->server packets into a rolling "
+                            + PLUGIN_CONFIG.miner.sniffBufferLines + "-line buffer. `.aqm sniff dump` to print it.");
+                }))
+                .then(literal("dump").executes(c -> {
+                    var m = MODULE.get(PacketSnifferModule.class);
+                    m.dump();
+                    c.getSource().getEmbed().title("Sniffer dump")
+                        .description("Printed " + m.bufferSize() + " buffered packet lines to the console.");
+                }))
+                .then(literal("clear").executes(c -> {
+                    MODULE.get(PacketSnifferModule.class).clearBuffer();
+                    c.getSource().getEmbed().title("Sniffer buffer cleared");
+                }))
+                .then(literal("1s").executes(c -> { MODULE.get(PacketSnifferModule.class).startTimed(1);
+                    c.getSource().getEmbed().title("Capturing packets for 1s (verbose) - then auto-dump"); }))
+                .then(literal("3s").executes(c -> { MODULE.get(PacketSnifferModule.class).startTimed(3);
+                    c.getSource().getEmbed().title("Capturing packets for 3s (verbose) - then auto-dump"); }))
+                .then(literal("5s").executes(c -> { MODULE.get(PacketSnifferModule.class).startTimed(5);
+                    c.getSource().getEmbed().title("Capturing packets for 5s (verbose) - then auto-dump"); }))
+                .then(literal("10s").executes(c -> { MODULE.get(PacketSnifferModule.class).startTimed(10);
+                    c.getSource().getEmbed().title("Capturing packets for 10s (verbose) - then auto-dump"); }))
+                .then(literal("live").then(argument("toggle", toggle()).executes(c -> {
+                    PLUGIN_CONFIG.miner.sniffLive = getToggle(c, "toggle");
+                    c.getSource().getEmbed().title("Sniffer live logging " + toggleStrCaps(PLUGIN_CONFIG.miner.sniffLive));
+                })))
+                .then(literal("body").then(argument("toggle", toggle()).executes(c -> {
+                    PLUGIN_CONFIG.miner.sniffBody = getToggle(c, "toggle");
+                    c.getSource().getEmbed().title("Sniffer packet body " + toggleStrCaps(PLUGIN_CONFIG.miner.sniffBody));
+                })))
+                .then(literal("dir")
+                    .then(literal("in").executes(c -> { PLUGIN_CONFIG.miner.sniffDir = "in";
+                        c.getSource().getEmbed().title("Sniffer direction: inbound (from server) only"); }))
+                    .then(literal("out").executes(c -> { PLUGIN_CONFIG.miner.sniffDir = "out";
+                        c.getSource().getEmbed().title("Sniffer direction: outbound (to server) only"); }))
+                    .then(literal("both").executes(c -> { PLUGIN_CONFIG.miner.sniffDir = "both";
+                        c.getSource().getEmbed().title("Sniffer direction: both"); })))
+                .then(literal("filter")
+                    .then(literal("off").executes(c -> { PLUGIN_CONFIG.miner.sniffFilter = "";
+                        c.getSource().getEmbed().title("Sniffer filter cleared"); }))
+                    .then(argument("text", word()).executes(c -> {
+                        PLUGIN_CONFIG.miner.sniffFilter = getString(c, "text");
+                        c.getSource().getEmbed().title("Sniffer filter: " + getString(c, "text"))
+                            .description("Only packets whose class name contains this are captured.");
+                    })))
+                .then(literal("template")
+                    .then(literal("list").executes(c -> {
+                        c.getSource().getEmbed().title("Sniffer templates")
+                            .description(String.join(", ", PacketSniffer.templateNames())
+                                + "\nApply with `.aqm sniff template <name>`, clear with `.aqm sniff template off`.");
+                    }))
+                    .then(literal("off").executes(c -> { PLUGIN_CONFIG.miner.sniffTemplate = "";
+                        c.getSource().getEmbed().title("Sniffer template cleared"); }))
+                    .then(argument("name", word()).executes(c -> {
+                        String n = getString(c, "name").toLowerCase();
+                        if (!PacketSniffer.templateNames().contains(n)) {
+                            c.getSource().getEmbed().title("Unknown template: " + n)
+                                .description("Options: " + String.join(", ", PacketSniffer.templateNames()));
+                            return ERROR;
+                        }
+                        PLUGIN_CONFIG.miner.sniffTemplate = n;
+                        c.getSource().getEmbed().title("Sniffer template: " + n)
+                            .description("Matches names containing: " + String.join(", ", PacketSniffer.templateSubs(n)));
+                        return OK;
+                    }))))
             .then(literal("deposit")
                 .then(argument("toggle", toggle()).executes(c -> {
                     PLUGIN_CONFIG.miner.depositToChests = getToggle(c, "toggle");
@@ -390,6 +465,12 @@ public class AquariusMinerCommand extends Command {
                     + (PLUGIN_CONFIG.miner.refillEmpties ? "; refill " + PLUGIN_CONFIG.miner.emptiesPerTrip : "") + ")"
                 : "off")
             .addField("Safety", "player-pause " + toggleStr(PLUGIN_CONFIG.miner.pauseOnPlayer)
-                + " (" + (int) PLUGIN_CONFIG.miner.playerPauseRange + "b), auto-dc " + toggleStr(PLUGIN_CONFIG.miner.autoDisconnect));
+                + " (" + (int) PLUGIN_CONFIG.miner.playerPauseRange + "b), auto-dc " + toggleStr(PLUGIN_CONFIG.miner.autoDisconnect))
+            .addField("Sniffer", PLUGIN_CONFIG.miner.sniffEnabled
+                ? "on (" + PLUGIN_CONFIG.miner.sniffDir
+                    + (PLUGIN_CONFIG.miner.sniffTemplate.isEmpty() ? "" : ", template " + PLUGIN_CONFIG.miner.sniffTemplate)
+                    + (PLUGIN_CONFIG.miner.sniffFilter.isEmpty() ? "" : ", filter '" + PLUGIN_CONFIG.miner.sniffFilter + "'")
+                    + (MODULE.get(PacketSnifferModule.class).bufferSize() > 0 ? ", " + MODULE.get(PacketSnifferModule.class).bufferSize() + " buffered" : "") + ")"
+                : "off");
     }
 }
