@@ -1,4 +1,4 @@
-### this project has been archived
+# THIS PROJECT HAS BEEN ARCHIVED
 
 # Aquarius Miner (ZenithProxy plugin) 
 
