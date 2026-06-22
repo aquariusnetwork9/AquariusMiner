@@ -1,4 +1,6 @@
-# Aquarius Miner (ZenithProxy plugin)
+### this project has been archived
+
+# Aquarius Miner (ZenithProxy plugin) 
 
 An AFK bulk quarry miner for [ZenithProxy](https://github.com/rfresh2/ZenithProxy), by Shallowplague. It clears one
 chunk at a time within a configurable Y band, then spirals outward to the next chunk — designed for
